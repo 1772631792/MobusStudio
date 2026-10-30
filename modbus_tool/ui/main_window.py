@@ -184,31 +184,6 @@ class MainWindow(QMainWindow):
         status.setSizeGripEnabled(False)
         self.status_label = QLabel("就绪 · 等待连接串口")
         status.addWidget(self.status_label, 1)
-        recent = QWidget()
-        recent_layout = QHBoxLayout(recent)
-        recent_layout.setContentsMargins(8, 0, 8, 0)
-        recent_layout.setSpacing(5)
-        recent_layout.addWidget(QLabel("最近帧  站号"))
-        self.recent_address = QLabel("---")
-        self.recent_address.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.recent_address.setFixedWidth(42)
-        recent_layout.addWidget(self.recent_address)
-        recent_layout.addWidget(QLabel("·"))
-        self.recent_function = QLabel("等待数据")
-        self.recent_function.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.recent_function.setFixedWidth(132)
-        recent_layout.addWidget(self.recent_function)
-        recent_layout.addWidget(QLabel("·"))
-        self.recent_bytes = QLabel("0")
-        self.recent_bytes.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.recent_bytes.setFixedWidth(52)
-        recent_layout.addWidget(self.recent_bytes)
-        recent_layout.addWidget(QLabel("bytes  ·  CRC"))
-        self.recent_crc = QLabel("---")
-        self.recent_crc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.recent_crc.setFixedWidth(48)
-        recent_layout.addWidget(self.recent_crc)
-        status.addPermanentWidget(recent)
         status.addPermanentWidget(QLabel("RTU  |  v0.2.0"))
         self.setStatusBar(status)
 
@@ -1985,11 +1960,6 @@ class MainWindow(QMainWindow):
             if not self._handle_write_response(frame):
                 self._handle_poll_response(frame)
         self._overview_dirty = True
-        self._set_label_text(self.recent_address, address)
-        self._set_label_text(self.recent_function, function)
-        self._set_label_text(self.recent_bytes, str(len(raw)))
-        self._set_label_text(self.recent_crc, crc_label)
-        self.recent_crc.setStyleSheet(f"color:{'#259b65' if frame.crc_ok else '#df5262'}")
 
     @staticmethod
     def _set_label_text(label: QLabel, text: str) -> None:
@@ -2726,11 +2696,6 @@ class MainWindow(QMainWindow):
         self.rx_bytes = self.tx_bytes = self.good_frames = self.bad_frames = 0
         for label in (self.rx_metric, self.tx_metric, self.good_metric, self.bad_metric):
             label.setText("0")
-        self._set_label_text(self.recent_address, "---")
-        self._set_label_text(self.recent_function, "等待数据")
-        self._set_label_text(self.recent_bytes, "0")
-        self._set_label_text(self.recent_crc, "---")
-        self.recent_crc.setStyleSheet("")
         self.status_label.setText("数据已清空")
 
     def _restore_settings(self) -> None:
