@@ -7,7 +7,7 @@ from itertools import islice
 import math
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QRegion, QWheelEvent
 from PySide6.QtWidgets import QMenu, QStyle, QStyleOptionTab, QStylePainter, QTabBar, QWidget
 
 
@@ -33,12 +33,17 @@ class HorizontalTextSideTabBar(QTabBar):
 
 
 class GlassMenu(QMenu):
-    """Rounded, slightly translucent menu whose submenus keep the same treatment."""
+    """A truly clipped rounded menu whose submenus keep the same treatment."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setWindowOpacity(0.96)
+        self.setWindowOpacity(1.0)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 12, 12)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
     def addMenu(self, menu_or_title):  # noqa: N802
         if isinstance(menu_or_title, str):
@@ -53,6 +58,7 @@ class LivePlotWidget(QWidget):
 
     viewport_changed = Signal(str)
     binding_menu_requested = Signal(object)
+    activated = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -215,6 +221,7 @@ class LivePlotWidget(QWidget):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self.activated.emit()
         if event.button() == Qt.MouseButton.LeftButton:
             for rect, name in self._legend_rows:
                 if rect.contains(event.position()):
@@ -378,17 +385,21 @@ class LivePlotWidget(QWidget):
                         painter.setBrush(self._colors.get(name, QColor("#08b9a1")))
                         painter.drawEllipse(QPointF(x, y), 4.5, 4.5)
                 if rows:
-                    panel_width = min(270.0, max(170.0, max(len(name) for name, _value, _color in rows) * 8.0 + 105.0))
+                    desired_width = max(
+                        320.0,
+                        max(len(name) for name, _value, _color in rows) * 10.0 + 185.0,
+                    )
+                    panel_width = min(max(220.0, plot.width() - 20.0), min(440.0, desired_width))
                     panel_height = 28.0 + min(12, len(rows)) * 22.0
                     panel_x = self._cursor_pos.x() + 14.0
                     if panel_x + panel_width > plot.right():
-                        panel_x = self._cursor_pos.x() - panel_width - 14.0
+                        panel_x = max(plot.left() + 6.0, self._cursor_pos.x() - panel_width - 14.0)
                     panel_y = max(plot.top() + 6.0, min(self._cursor_pos.y() + 12.0, plot.bottom() - panel_height - 6.0))
                     panel = QRectF(panel_x, panel_y, panel_width, panel_height)
                     painter.setPen(QPen(grid, 1))
                     painter.setBrush(QColor(15, 24, 36, 238) if dark else QColor(255, 255, 255, 245))
                     painter.drawRoundedRect(panel, 6, 6)
-                    painter.setFont(QFont("Microsoft YaHei UI", 9))
+                    painter.setFont(QFont("Microsoft YaHei UI", 10))
                     painter.setPen(text)
                     painter.drawText(QRectF(panel.left() + 10, panel.top() + 4, panel.width() - 20, 20), f"样本 #{sample_index + 1}")
                     for row_index, (name, value, color) in enumerate(rows[:12]):
@@ -397,10 +408,10 @@ class LivePlotWidget(QWidget):
                         painter.setBrush(color)
                         painter.drawEllipse(QRectF(panel.left() + 10, y + 5, 8, 8))
                         painter.setPen(text)
-                        label = name if len(name) <= 22 else name[:21] + "…"
-                        painter.drawText(QRectF(panel.left() + 25, y, panel.width() - 96, 19), label)
+                        label = name if len(name) <= 30 else name[:29] + "…"
+                        painter.drawText(QRectF(panel.left() + 25, y, panel.width() - 175, 19), label)
                         painter.drawText(
-                            QRectF(panel.right() - 88, y, 78, 19),
+                            QRectF(panel.right() - 145, y, 135, 19),
                             Qt.AlignmentFlag.AlignRight,
                             f"{value:.8g}",
                         )

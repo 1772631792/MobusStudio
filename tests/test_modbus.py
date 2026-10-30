@@ -1,7 +1,14 @@
 import pytest
 
 from modbus_tool.core.data_parser import encode_typed_values, modbus_data_area, parse_typed_values
-from modbus_tool.core.modbus import append_crc, build_request, check_crc, crc16, parse_hex
+from modbus_tool.core.modbus import (
+    append_crc,
+    build_request,
+    check_crc,
+    crc16,
+    parse_hex,
+    write_response_status,
+)
 
 
 def test_known_crc_vector():
@@ -19,6 +26,23 @@ def test_build_write_multiple_registers():
     frame = build_request(1, 16, 0x10, values=[100, 200])
     assert frame[:9] == bytes.fromhex("01 10 00 10 00 02 04 00 64")
     assert check_crc(frame)
+
+
+def test_write_response_status_accepts_standard_echoes():
+    single = build_request(1, 6, 0x10, values=[100])
+    assert write_response_status(single, single) == "success"
+
+    multiple = build_request(1, 16, 0x10, values=[100, 200])
+    response = append_crc(multiple[:6])
+    assert write_response_status(multiple, response) == "success"
+
+
+def test_write_response_status_rejects_unrelated_and_detects_exception():
+    request = build_request(1, 16, 0x10, values=[100, 200])
+    unrelated = append_crc(bytes.fromhex("02 10 00 10 00 02"))
+    exception = append_crc(bytes.fromhex("01 90 02"))
+    assert write_response_status(request, unrelated) is None
+    assert write_response_status(request, exception) == "exception"
 
 
 def test_build_multiple_coils_packs_lsb_first():

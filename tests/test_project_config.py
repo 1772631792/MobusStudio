@@ -84,9 +84,11 @@ def test_project_validation_accepts_two_wave_views():
         {"x_zoom": 2.0, "y_zoom": 0.5},
     ]
     document["ui"]["active_wave_view"] = 1
+    document["ui"]["wave_layout"] = 1
     result = validate_project(document)
     assert result["parsers"][0]["plot_views"] == [[0], [1]]
     assert result["ui"]["active_wave_view"] == 1
+    assert result["ui"]["wave_layout"] == 1
 
 
 def test_project_validation_rejects_inconsistent_wave_view_bindings():

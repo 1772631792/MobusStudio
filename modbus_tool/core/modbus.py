@@ -37,6 +37,29 @@ def check_crc(frame: bytes) -> bool:
     return len(frame) >= 4 and crc16(frame[:-2]) == int.from_bytes(frame[-2:], "little")
 
 
+def write_response_status(request: bytes, response: bytes) -> str | None:
+    """Classify a response to a standard write request.
+
+    Returns ``"success"`` for the expected write echo, ``"exception"`` for a
+    valid Modbus exception from the same slave, or ``None`` for an unrelated or
+    malformed frame.
+    """
+    if len(request) < 8 or len(response) < 5 or not check_crc(response):
+        return None
+    address, function = request[0], request[1]
+    if response[0] != address:
+        return None
+    if response[1] == (function | 0x80):
+        return "exception" if len(response) == 5 else None
+    if response[1] != function:
+        return None
+    if function in (5, 6):
+        return "success" if response == request else None
+    if function in (15, 16):
+        return "success" if len(response) == 8 and response[:6] == request[:6] else None
+    return None
+
+
 def hex_text(data: bytes) -> str:
     return " ".join(f"{value:02X}" for value in data)
 

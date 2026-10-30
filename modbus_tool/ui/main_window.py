@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -52,6 +53,7 @@ from modbus_tool.core.modbus import (
     build_request,
     hex_text,
     parse_hex,
+    write_response_status,
 )
 from modbus_tool.core.data_parser import encode_typed_values, modbus_data_area, parse_typed_values, type_size
 from modbus_tool.core.project_config import PROJECT_SCHEMA, PROJECT_VERSION, validate_project
@@ -113,6 +115,9 @@ class MainWindow(QMainWindow):
         self.bad_frames = 0
         self._last_preview = b""
         self._last_write_frame = b""
+        self._queued_write_frame: bytes | None = None
+        self._active_write_frame = b""
+        self.write_in_progress = False
         self._known_ports: tuple[tuple[str, str, str], ...] = ()
         self.parsers: list[dict] = []
         self._parser_sequence = 0
@@ -372,24 +377,34 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.addWidget(QLabel("实时数据波形", objectName="sectionTitle"))
-        title_box.addWidget(QLabel("波形 A / B 独立绑定 · 在绘图区右键选择解析成员", objectName="muted"))
+        title_box.addWidget(QLabel("单窗口 / 上下分屏 · 在绘图区右键选择解析成员", objectName="muted"))
         header.addLayout(title_box)
         header.addStretch()
         self.wave_record_count = QLabel("已记录 0 行", objectName="muted")
         header.addWidget(self.wave_record_count)
         self.wave_tabs = QTabWidget()
         self.live_plots = [LivePlotWidget(), LivePlotWidget()]
+        self.active_wave_plot_index = 0
         for index, plot in enumerate(self.live_plots):
-            self.wave_tabs.addTab(plot, f"波形 {'AB'[index]}")
             plot.viewport_changed.connect(
                 lambda text, view=index: self._wave_viewport_changed(view, text)
             )
             plot.binding_menu_requested.connect(
                 lambda menu, view=index: self._populate_wave_binding_menu(menu, view)
             )
+            plot.activated.connect(lambda view=index: self._activate_wave_plot(view))
+        self.single_wave_page = QWidget()
+        self.single_wave_layout = QVBoxLayout(self.single_wave_page)
+        self.single_wave_layout.setContentsMargins(0, 0, 0, 0)
+        self.single_wave_layout.addWidget(self.live_plots[0])
+        self.split_wave_view = QSplitter(Qt.Orientation.Vertical)
+        self.split_wave_view.setChildrenCollapsible(False)
+        self.split_wave_view.addWidget(self.live_plots[1])
+        self.wave_tabs.addTab(self.single_wave_page, "单窗口")
+        self.wave_tabs.addTab(self.split_wave_view, "上下分屏")
         # Keep the original attribute for old project files and third-party code.
         self.live_plot = self.live_plots[0]
-        self.wave_tabs.currentChanged.connect(self._wave_tab_changed)
+        self.wave_tabs.currentChanged.connect(self._wave_layout_changed)
         reset_plot = QPushButton("适应视图")
         reset_plot.setToolTip("恢复自动量程并回到最新数据；也可在绘图区双击")
         reset_plot.clicked.connect(lambda: self._active_live_plot().reset_view())
@@ -411,17 +426,31 @@ class MainWindow(QMainWindow):
         return widget
 
     def _active_live_plot(self) -> LivePlotWidget:
-        return self.live_plots[self.wave_tabs.currentIndex()]
+        return self.live_plots[self.active_wave_plot_index]
 
     def _wave_viewport_changed(self, view: int, text: str) -> None:
-        if self.wave_tabs.currentIndex() == view:
+        if self.active_wave_plot_index == view:
             self.wave_view_state.setText(text)
 
-    def _wave_tab_changed(self, view: int) -> None:
-        self.wave_view_state.setText(self.live_plots[view]._view_state_text())
+    def _activate_wave_plot(self, view: int) -> None:
+        self.active_wave_plot_index = view
+        self.wave_view_state.setText(
+            f"波形 {'AB'[view]} · {self.live_plots[view]._view_state_text()}"
+        )
+
+    def _wave_layout_changed(self, mode: int) -> None:
+        """Move plot A between a full-size page and the upper split pane."""
+        if mode == 0:
+            self.single_wave_layout.addWidget(self.live_plots[0])
+            self._activate_wave_plot(0)
+            return
+        self.split_wave_view.insertWidget(0, self.live_plots[0])
+        self.split_wave_view.setSizes([1, 1])
+        self._activate_wave_plot(0)
 
     def _populate_wave_binding_menu(self, menu: QMenu, view: int) -> None:
         """Build a channel chooser directly inside a waveform context menu."""
+        self._activate_wave_plot(view)
         for config in self.parsers:
             indices = sorted(config["enabled"])
             if not indices:
@@ -607,10 +636,40 @@ class MainWindow(QMainWindow):
         poll_hint.setObjectName("muted")
         layout.addWidget(poll_hint)
 
-        self.poll_status = QLabel("尚未开始")
-        self.poll_status.setWordWrap(True)
-        self.poll_status.setStyleSheet("background:#e7f4f8;color:#187195;padding:10px;border-radius:7px")
-        layout.addWidget(self.poll_status)
+        poll_status_card = QFrame(objectName="pollStatusCard")
+        status_grid = QGridLayout(poll_status_card)
+        status_grid.setContentsMargins(12, 9, 12, 9)
+        status_grid.setHorizontalSpacing(8)
+        status_grid.setVerticalSpacing(6)
+        status_grid.addWidget(QLabel("状态", objectName="muted"), 0, 0)
+        self.poll_state_value = QLabel("尚未开始", objectName="pollValue")
+        self.poll_state_value.setFixedWidth(72)
+        status_grid.addWidget(self.poll_state_value, 0, 1)
+        status_grid.addWidget(QLabel("成功", objectName="muted"), 0, 2)
+        self.poll_success_value = QLabel("0", objectName="pollValue")
+        self.poll_success_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.poll_success_value.setFixedWidth(64)
+        status_grid.addWidget(self.poll_success_value, 0, 3)
+        status_grid.addWidget(QLabel("超时/异常", objectName="muted"), 0, 4)
+        self.poll_failure_value = QLabel("0", objectName="pollValue")
+        self.poll_failure_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.poll_failure_value.setFixedWidth(64)
+        status_grid.addWidget(self.poll_failure_value, 0, 5)
+        status_grid.addWidget(QLabel("范围", objectName="muted"), 1, 0)
+        self.poll_range_value = QLabel("—", objectName="pollValue")
+        self.poll_range_value.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        status_grid.addWidget(self.poll_range_value, 1, 1, 1, 3)
+        status_grid.addWidget(QLabel("响应", objectName="muted"), 1, 4)
+        self.poll_response_value = QLabel("—", objectName="pollValue")
+        self.poll_response_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.poll_response_value.setFixedWidth(96)
+        status_grid.addWidget(self.poll_response_value, 1, 5)
+        for column, width in enumerate((36, 80, 36, 64, 84, 96)):
+            status_grid.setColumnMinimumWidth(column, width)
+        status_grid.setColumnStretch(1, 1)
+        layout.addWidget(poll_status_card)
         layout.addStretch()
         self.poll_button = QPushButton("开始安全轮询", objectName="primary")
         self.poll_button.clicked.connect(self._toggle_polling)
@@ -696,20 +755,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(add_parser)
 
         self.parser_tree = QTreeWidget()
-        self.parser_tree.setColumnCount(4)
-        self.parser_tree.setHeaderLabels(["变量 / 结构", "地址 · 类型", "当前值", "波形"])
+        self.parser_tree.setColumnCount(3)
+        self.parser_tree.setHeaderLabels(["变量 / 结构", "地址 · 类型", "当前值"])
         self.parser_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.parser_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.parser_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.parser_tree.customContextMenuRequested.connect(self._show_parser_context_menu)
         self.parser_tree.itemDoubleClicked.connect(self._rename_parser_from_double_click)
-        self.parser_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.parser_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.parser_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.parser_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.parser_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.parser_tree.header().resizeSection(1, 110)
-        self.parser_tree.header().resizeSection(2, 85)
-        self.parser_tree.header().resizeSection(3, 85)
+        self.parser_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.parser_tree.header().resizeSection(0, 125)
+        self.parser_tree.header().resizeSection(1, 105)
         self.parser_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.parser_tree.setMinimumHeight(220)
         self.parser_tree.setAlternatingRowColors(True)
@@ -729,7 +786,7 @@ class MainWindow(QMainWindow):
     def _build_write_tab(self) -> QWidget:
         page, layout = self._tab_page()
         layout.addWidget(QLabel("类型化数据写入", objectName="sectionTitle"))
-        note = QLabel("直接填写数值，软件自动编码数据、选择写功能码并补齐CRC")
+        note = QLabel("直接填写数值；轮询运行时会在响应间隙安全写入，完成后自动恢复")
         note.setWordWrap(True)
         note.setObjectName("muted")
         layout.addWidget(note)
@@ -791,6 +848,9 @@ class MainWindow(QMainWindow):
         self.write_button.clicked.connect(self._send_typed_write)
         self.write_button.setEnabled(False)
         layout.addWidget(self.write_button)
+        self.write_timeout_timer = QTimer(self)
+        self.write_timeout_timer.setSingleShot(True)
+        self.write_timeout_timer.timeout.connect(self._write_timed_out)
 
         self.write_target.currentIndexChanged.connect(self._write_target_changed)
         self.write_address.valueChanged.connect(self._update_write_preview)
@@ -871,7 +931,9 @@ class MainWindow(QMainWindow):
             self.write_hint.setText(f"{detail} · 完整帧 {len(frame)} bytes")
             self.write_hint.setStyleSheet("color:#209567")
             self._last_write_frame = frame
-            self.write_button.setEnabled(True)
+            self.write_button.setEnabled(
+                not self.write_in_progress and self._queued_write_frame is None
+            )
         except (ValueError, OverflowError) as exc:
             self.write_function_label.setText("数据无效")
             self.write_register_preview.setText("寄存器：—")
@@ -883,11 +945,11 @@ class MainWindow(QMainWindow):
     def _send_typed_write(self) -> None:
         if not self._last_write_frame:
             return
-        if self.poll_active:
-            self.status_label.setText("安全轮询运行中，请先停止轮询再执行写入")
-            return
         if not self.worker or not self.worker.isRunning():
             QMessageBox.information(self, "尚未连接", "请先连接串口，再发送写入命令。")
+            return
+        if self.write_in_progress or self._queued_write_frame is not None:
+            self.status_label.setText("已有写入命令正在等待或执行")
             return
         if self.write_confirm.isChecked():
             answer = QMessageBox.question(
@@ -900,15 +962,86 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        frame = bytes(self._last_write_frame)
+        if self.poll_active:
+            self._queued_write_frame = frame
+            self.poll_next_timer.stop()
+            self.write_button.setEnabled(False)
+            self.write_button.setText("等待轮询间隙…")
+            self._set_label_text(self.poll_state_value, "等待写入")
+            self.status_label.setText("写入已排队 · 当前轮询响应结束后自动发送")
+            if not self.poll_waiting:
+                self._send_queued_write()
+            return
         try:
-            self.worker.send(self._last_write_frame)
+            self.worker.send(frame)
         except serial.SerialException as exc:
             self._on_serial_error(str(exc))
             return
-        self.tx_bytes += len(self._last_write_frame)
+        self.tx_bytes += len(frame)
         self.tx_metric.setText(f"{self.tx_bytes:,}")
-        self._on_frame(self._last_write_frame, "TX")
+        self._on_frame(frame, "TX")
         self.status_label.setText("写入命令已发送，等待从站响应")
+
+    def _send_queued_write(self) -> None:
+        if self._queued_write_frame is None or self.write_in_progress:
+            return
+        if not self.worker or not self.worker.isRunning():
+            self._finish_interleaved_write("写入取消：串口已断开")
+            return
+        frame = self._queued_write_frame
+        self._queued_write_frame = None
+        self._active_write_frame = frame
+        self.write_in_progress = True
+        self.write_button.setText("写入中…")
+        self._set_label_text(self.poll_state_value, "写入中")
+        try:
+            self.worker.send(frame)
+        except serial.SerialException as exc:
+            self._finish_interleaved_write(f"写入发送失败：{exc}")
+            return
+        self.tx_bytes += len(frame)
+        self.tx_metric.setText(f"{self.tx_bytes:,}")
+        self._on_frame(frame, "TX")
+        self.write_timeout_timer.start(self.poll_timeout.value())
+        self.status_label.setText("轮询已暂缓 · 写入命令已发送，等待从站响应")
+
+    def _handle_write_response(self, frame: RtuFrame) -> bool:
+        if not self.write_in_progress:
+            return False
+        result = write_response_status(self._active_write_frame, frame.raw)
+        if result is None:
+            return False
+        if result == "success":
+            self._finish_interleaved_write("写入成功 · 已自动恢复安全轮询")
+        else:
+            self._finish_interleaved_write(
+                f"写入被从站拒绝（{frame.summary}）· 已自动恢复安全轮询"
+            )
+        return True
+
+    def _write_timed_out(self) -> None:
+        if self.write_in_progress:
+            self._finish_interleaved_write("写入响应超时 · 已自动恢复安全轮询")
+
+    def _finish_interleaved_write(self, message: str) -> None:
+        self._reset_write_transaction()
+        self.status_label.setText(message)
+        if self.poll_active and self.worker and self.worker.isRunning():
+            self._set_label_text(self.poll_state_value, "运行中")
+            self.poll_next_timer.start(self.poll_interval.value())
+        else:
+            self._set_label_text(self.poll_state_value, "已停止")
+
+    def _reset_write_transaction(self) -> None:
+        if hasattr(self, "write_timeout_timer"):
+            self.write_timeout_timer.stop()
+        self.write_in_progress = False
+        self._active_write_frame = b""
+        self._queued_write_frame = None
+        if hasattr(self, "write_button"):
+            self.write_button.setText("发送写入命令")
+            self.write_button.setEnabled(bool(self._last_write_frame))
 
     def _build_send_tab(self) -> QWidget:
         page, layout = self._tab_page()
@@ -1170,7 +1303,8 @@ class MainWindow(QMainWindow):
                 "splitter_sizes": self.body_splitter.sizes(),
                 "wave_view": self.live_plot.view_state(),
                 "wave_views": [plot.view_state() for plot in self.live_plots],
-                "active_wave_view": self.wave_tabs.currentIndex(),
+                "wave_layout": self.wave_tabs.currentIndex(),
+                "active_wave_view": self.active_wave_plot_index,
             },
         }
 
@@ -1327,7 +1461,9 @@ class MainWindow(QMainWindow):
         wave_views = ui.get("wave_views", [ui["wave_view"], ui["wave_view"]])
         for plot, state in zip(self.live_plots, wave_views):
             plot.restore_view_state(state)
-        self.wave_tabs.setCurrentIndex(ui.get("active_wave_view", 0))
+        self.wave_tabs.setCurrentIndex(ui.get("wave_layout", 0))
+        if self.wave_tabs.currentIndex() == 1:
+            self._activate_wave_plot(ui.get("active_wave_view", 0))
         self._apply_filters()
         self._update_builder()
         self._update_write_preview()
@@ -1419,6 +1555,7 @@ class MainWindow(QMainWindow):
         self.send_timer.stop()
         self.repeat_send.setChecked(False)
         self._stop_polling(silent=True)
+        self._reset_write_transaction()
         if self.worker:
             if not self.worker.stop():
                 self.status_label.setText("串口线程仍在退出，请稍后重试")
@@ -1427,6 +1564,8 @@ class MainWindow(QMainWindow):
         self._on_serial_status(False, "已断开")
 
     def _on_serial_status(self, connected: bool, detail: str) -> None:
+        if not connected and (self.write_in_progress or self._queued_write_frame is not None):
+            self._reset_write_transaction()
         self.connect_button.setEnabled(True)
         self.connect_button.setText("断开连接" if connected else "连接串口")
         self.connect_button.setObjectName("danger" if connected else "primary")
@@ -1480,7 +1619,8 @@ class MainWindow(QMainWindow):
             else:
                 self.bad_frames += 1
             if direction == "RX":
-                self._handle_poll_response(frame)
+                if not self._handle_write_response(frame):
+                    self._handle_poll_response(frame)
             return
         self.frames.append(frame)
         while len(self.frames) > self.keep_limit.value():
@@ -1548,7 +1688,8 @@ class MainWindow(QMainWindow):
         if direction == "RX" and frame.crc_ok:
             self._parse_frame_channels(frame)
         if direction == "RX":
-            self._handle_poll_response(frame)
+            if not self._handle_write_response(frame):
+                self._handle_poll_response(frame)
         if self.auto_scroll.isChecked():
             if not poll_slot:
                 self.frame_table.scrollToBottom()
@@ -1682,6 +1823,11 @@ class MainWindow(QMainWindow):
         self.poll_waiting = False
         self.poll_success = 0
         self.poll_failures = 0
+        self._set_label_text(self.poll_state_value, "运行中")
+        self._set_label_text(self.poll_success_value, "0")
+        self._set_label_text(self.poll_failure_value, "0")
+        self._set_label_text(self.poll_response_value, "等待")
+        self._update_poll_range_display()
         self.repeat_send.setChecked(False)
         self._ensure_poll_rows()
         for widget in (self.poll_address, self.poll_function, self.poll_start, self.poll_quantity):
@@ -1706,11 +1852,29 @@ class MainWindow(QMainWindow):
             self.poll_button.style().polish(self.poll_button)
             for widget in (self.poll_address, self.poll_function, self.poll_start, self.poll_quantity):
                 widget.setEnabled(True)
+        cancelled_write = self._queued_write_frame is not None and not self.write_in_progress
+        if cancelled_write:
+            self._reset_write_transaction()
         if was_active and not silent:
-            self.status_label.setText("寄存器轮询已停止")
+            self.status_label.setText(
+                "轮询已停止，排队中的写入已取消"
+                if cancelled_write else "寄存器轮询已停止"
+            )
+        if was_active and not self.write_in_progress:
+            self._set_label_text(self.poll_state_value, "已停止")
+
+    def _update_poll_range_display(self) -> None:
+        start = self.poll_start.value()
+        end = start + self.poll_quantity.value() - 1
+        self._set_label_text(self.poll_range_value, f"R{start}～R{end}")
 
     def _send_poll_request(self) -> None:
-        if not self.poll_active or self.poll_waiting:
+        if (
+            not self.poll_active
+            or self.poll_waiting
+            or self.write_in_progress
+            or self._queued_write_frame is not None
+        ):
             return
         if not self.worker or not self.worker.isRunning():
             self._stop_polling(silent=True)
@@ -1736,10 +1900,7 @@ class MainWindow(QMainWindow):
         self.poll_sent_quantity = self.poll_quantity.value()
         self.poll_sent_at = time.perf_counter()
         self.poll_timeout_timer.start(self.poll_timeout.value())
-        self.poll_status.setText(
-            f"运行中 · 成功 {self.poll_success} · 超时/异常 {self.poll_failures}\n"
-            f"R{self.poll_start.value()}～R{self.poll_start.value() + self.poll_quantity.value() - 1}"
-        )
+        self._update_poll_range_display()
 
     def _handle_poll_response(self, frame: RtuFrame) -> None:
         if not self.poll_active or not self.poll_waiting:
@@ -1759,24 +1920,29 @@ class MainWindow(QMainWindow):
         expected_length = data_bytes + 5
         if frame.crc_ok and frame.function == expected_function and len(frame.raw) == expected_length:
             self.poll_success += 1
-            result = f"最近响应 {elapsed_ms:.1f} ms"
+            response = f"{elapsed_ms:.1f} ms"
         else:
             self.poll_failures += 1
-            result = "最近响应异常"
-        self.poll_status.setText(
-            f"运行中 · 成功 {self.poll_success} · 超时/异常 {self.poll_failures}\n{result}"
-        )
-        self.poll_next_timer.start(self.poll_interval.value())
+            response = "异常"
+        self._set_label_text(self.poll_success_value, str(self.poll_success))
+        self._set_label_text(self.poll_failure_value, str(self.poll_failures))
+        self._set_label_text(self.poll_response_value, response)
+        self._continue_after_poll_cycle()
 
     def _poll_timed_out(self) -> None:
         if not self.poll_active or not self.poll_waiting:
             return
         self.poll_waiting = False
         self.poll_failures += 1
-        self.poll_status.setText(
-            f"运行中 · 成功 {self.poll_success} · 超时/异常 {self.poll_failures}\n最近请求超时"
-        )
-        self.poll_next_timer.start(self.poll_interval.value())
+        self._set_label_text(self.poll_failure_value, str(self.poll_failures))
+        self._set_label_text(self.poll_response_value, "超时")
+        self._continue_after_poll_cycle()
+
+    def _continue_after_poll_cycle(self) -> None:
+        if self._queued_write_frame is not None:
+            self._send_queued_write()
+        elif self.poll_active:
+            self.poll_next_timer.start(self.poll_interval.value())
 
     def _poll_function_changed(self) -> None:
         function = self.poll_function.currentData()
@@ -1900,11 +2066,9 @@ class MainWindow(QMainWindow):
             config["name"],
             self._parser_member_location(config, 0) if is_single else f"{config['type']} × {config['count']}",
             "等待数据",
-            "未绑定" if is_single else "0 个已绑定",
         ])
         root.setData(0, Qt.ItemDataRole.UserRole, uid)
         root.setData(0, Qt.ItemDataRole.UserRole + 1, 0 if is_single else -1)
-        root.setForeground(0, QColor(config["color"]))
         self.parser_tree.addTopLevelItem(root)
         config["item"] = root
         config["member_items"] = {}
@@ -1912,7 +2076,7 @@ class MainWindow(QMainWindow):
             config["member_items"][0] = root
             return
         for index, member_name in enumerate(config["members"]):
-            item = QTreeWidgetItem([member_name, self._parser_member_location(config, index), "等待数据", "未绑定"])
+            item = QTreeWidgetItem([member_name, self._parser_member_location(config, index), "等待数据"])
             item.setData(0, Qt.ItemDataRole.UserRole, uid)
             item.setData(0, Qt.ItemDataRole.UserRole + 1, index)
             root.addChild(item)
@@ -1959,20 +2123,21 @@ class MainWindow(QMainWindow):
         state = "已绑定到" if enabled else "已移出"
         self.status_label.setText(f"“{self._series_name(config, index)}”{state}波形 {'AB'[view]}")
 
-    def _member_binding_text(self, config: dict, index: int) -> str:
-        views = "".join("AB"[view] for view in range(2) if index in config["plot_views"][view])
-        return f"● 波形 {views}" if views else "未绑定"
-
     def _refresh_parser_binding_text(self, config: dict) -> None:
         plots = config["plots"]
         if config["count"] == 1:
-            config["item"].setText(3, self._member_binding_text(config, 0))
-            config["item"].setForeground(3, QColor(config["color"]) if plots else QColor())
+            config["item"].setForeground(0, QColor(config["color"]) if plots else QColor())
+            views = "".join("AB"[view] for view in range(2) if 0 in config["plot_views"][view])
+            config["item"].setToolTip(0, f"已绑定波形 {views}" if views else "")
             return
-        config["item"].setText(3, f"{len(plots)} 个已绑定" if plots else "未绑定")
+        config["item"].setForeground(0, QColor(config["color"]) if plots else QColor())
+        config["item"].setToolTip(0, f"{len(plots)} 个成员已绑定波形" if plots else "")
         for index, item in config["member_items"].items():
-            item.setText(3, self._member_binding_text(config, index))
-            item.setForeground(3, QColor(config["color"]) if index in plots else QColor())
+            item.setForeground(0, QColor(config["color"]) if index in plots else QColor())
+            views = "".join(
+                "AB"[view] for view in range(2) if index in config["plot_views"][view]
+            )
+            item.setToolTip(0, f"已绑定波形 {views}" if views else "")
 
     def _show_parser_context_menu(self, position) -> None:
         item = self.parser_tree.itemAt(position)
@@ -1982,7 +2147,7 @@ class MainWindow(QMainWindow):
         self.parser_tree.setCurrentItem(item)
         menu = GlassMenu(self)
         is_structure = member < 0
-        active_view = self.wave_tabs.currentIndex()
+        active_view = self.active_wave_plot_index
         view_name = "AB"[active_view]
         if is_structure:
             bind_action = menu.addAction(f"全部添加到波形 {view_name}")

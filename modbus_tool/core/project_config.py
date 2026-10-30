@@ -172,6 +172,8 @@ def validate_project(document: object) -> dict:
                 raise ValueError(f"ui.wave_views[{index}] 的缩放值超出范围")
     if "active_wave_view" in ui:
         _integer(ui["active_wave_view"], "ui.active_wave_view", 0, 1)
+    if "wave_layout" in ui:
+        _integer(ui["wave_layout"], "ui.wave_layout", 0, 1)
 
     write = _mapping(root.get("write"), "write")
     _integer(write.get("address"), "write.address", 1, 247)

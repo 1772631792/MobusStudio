@@ -11,6 +11,8 @@ QLabel#brand { color: #056cb5; font-size: 20px; font-weight: 750; }
 QLabel#muted { color: #7d8998; }
 QLabel#sectionTitle { color: #086fb9; font-size: 15px; font-weight: 700; }
 QLabel#metric { color: #172a41; font-size: 23px; font-weight: 700; }
+QFrame#pollStatusCard { background: #e7f4f8; border: 1px solid #d1e9f1; border-radius: 10px; }
+QLabel#pollValue { color: #187195; font-family: 'Cascadia Mono', Consolas; font-weight: 650; }
 QPushButton { background: rgba(255, 255, 255, 225); border: 1px solid #ccd5df; border-radius: 9px; padding: 8px 14px; min-height: 22px; color: #354359; }
 QPushButton:hover { background: #f3f8fc; border-color: #81afd0; color: #056cb5; }
 QPushButton:pressed { background: #e5f0f8; }
@@ -39,9 +41,9 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollArea { border: none; background: transparent; }
 QSplitter::handle { background: #dce2e9; width: 2px; height: 2px; }
 QStatusBar { background: #e4e9ef; color: #6b7788; }
-QMenu { background: rgba(250, 252, 255, 238); border: 1px solid rgba(184, 198, 212, 210); border-radius: 12px; padding: 8px; font-size: 15px; }
+QMenu { background: #ffffff; border: 1px solid #c7d1dc; border-radius: 12px; padding: 8px; font-size: 15px; }
 QMenu::item { padding: 9px 28px 9px 14px; border-radius: 8px; margin: 1px 0; }
-QMenu::item:selected { background: rgba(207, 235, 247, 220); color: #066cae; }
+QMenu::item:selected { background: #dff2fa; color: #066cae; }
 QMenu::separator { height: 1px; background: rgba(189, 201, 214, 150); margin: 6px 10px; }
 """
 
@@ -57,6 +59,8 @@ QLabel#brand { color: #f4f8ff; font-size: 20px; font-weight: 700; }
 QLabel#muted { color: #78879b; }
 QLabel#sectionTitle { color: #f2f6fb; font-size: 15px; font-weight: 650; }
 QLabel#metric { color: #f7fbff; font-size: 23px; font-weight: 700; }
+QFrame#pollStatusCard { background: #10252d; border: 1px solid #1c3c47; border-radius: 10px; }
+QLabel#pollValue { color: #70d5e8; font-family: 'Cascadia Mono', Consolas; font-weight: 650; }
 QPushButton { background: rgba(25, 35, 52, 225); border: 1px solid #2a384d; border-radius: 9px; padding: 8px 14px; min-height: 22px; color: #dbe6f4; }
 QPushButton:hover { background: #223048; border-color: #3e526d; }
 QPushButton:pressed { background: #152032; }
