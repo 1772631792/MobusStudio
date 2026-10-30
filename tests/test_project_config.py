@@ -96,3 +96,16 @@ def test_project_validation_rejects_inconsistent_wave_view_bindings():
     document["parsers"][0]["plot_views"] = [[], []]
     with pytest.raises(ValueError, match="并集"):
         validate_project(document)
+
+
+def test_project_validation_accepts_alarm_rules_and_rejects_missing_channel():
+    document = sample_project()
+    document["alarms"] = [{
+        "id": "high-ua", "channel": "电压.Ua", "mode": "single",
+        "operator": "ge", "threshold1": 250.0, "threshold2": 0.0,
+        "enabled": True,
+    }]
+    assert validate_project(document)["alarms"][0]["channel"] == "电压.Ua"
+    document["alarms"][0]["channel"] = "不存在"
+    with pytest.raises(ValueError, match="channel"):
+        validate_project(document)

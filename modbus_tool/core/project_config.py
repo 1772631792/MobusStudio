@@ -132,6 +132,32 @@ def validate_project(document: object) -> dict:
                 raise ValueError(f"波形变量名称重复：{series}")
             series_names.add(series)
 
+    alarms = root.get("alarms", [])
+    if not isinstance(alarms, list) or len(alarms) > 512:
+        raise ValueError("alarms 必须是最多 512 项的数组")
+    alarm_ids: set[str] = set()
+    for pos, alarm in enumerate(alarms):
+        path = f"alarms[{pos}]"
+        alarm = _mapping(alarm, path)
+        rule_id = alarm.get("id")
+        if not isinstance(rule_id, str) or not rule_id or len(rule_id) > 128:
+            raise ValueError(f"{path}.id 必须是非空字符串")
+        if rule_id in alarm_ids:
+            raise ValueError(f"{path}.id 不能重复")
+        alarm_ids.add(rule_id)
+        channel = alarm.get("channel")
+        if channel not in series_names:
+            raise ValueError(f"{path}.channel 必须引用现有解析成员")
+        mode = _choice(alarm.get("mode"), f"{path}.mode", {"single", "double"})
+        operators = {"gt", "ge", "lt", "le", "eq"} if mode == "single" else {"outside", "inside"}
+        _choice(alarm.get("operator"), f"{path}.operator", operators)
+        threshold1 = _number(alarm.get("threshold1"), f"{path}.threshold1")
+        threshold2 = _number(alarm.get("threshold2"), f"{path}.threshold2")
+        if mode == "double" and threshold1 >= threshold2:
+            raise ValueError(f"{path} 的下限必须小于上限")
+        if not isinstance(alarm.get("enabled"), bool):
+            raise ValueError(f"{path}.enabled 必须是 true 或 false")
+
     receive = _mapping(root.get("receive"), "receive")
     _integer(receive.get("address_filter"), "receive.address_filter", 0, 247)
     _choice(receive.get("function_filter"), "receive.function_filter", {-1, 1, 2, 3, 4, 5, 6, 15, 16})
@@ -145,7 +171,7 @@ def validate_project(document: object) -> dict:
 
     ui = _mapping(root.get("ui"), "ui")
     _choice(ui.get("theme"), "ui.theme", {"light", "dark"})
-    _choice(ui.get("main_view"), "ui.main_view", {"frames", "raw", "overview", "waveform"})
+    _choice(ui.get("main_view"), "ui.main_view", {"frames", "raw", "overview", "waveform", "alarms"})
     _choice(ui.get("right_tab"), "ui.right_tab", {"receive", "poll", "parse", "write", "builder", "serial", "settings"})
     size = _mapping(ui.get("window_size"), "ui.window_size")
     _integer(size.get("width"), "ui.window_size.width", 800, 10000)

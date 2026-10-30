@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import csv
 from datetime import datetime
 import json
 import math
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
     QFrame,
     QFileDialog,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QTabWidget,
+    QTabBar,
     QTableView,
     QTreeWidget,
     QTreeWidgetItem,
@@ -46,6 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from modbus_tool.core.alarm import AlarmEvent, AlarmRule
 from modbus_tool.core.modbus import (
     FUNCTION_NAMES,
     RtuFrame,
@@ -61,6 +65,7 @@ from modbus_tool.core.serial_worker import SerialWorker
 from modbus_tool.core.settings import Settings
 from modbus_tool.core.wave_recorder import CsvExportWorker, WaveRecorder
 from modbus_tool.ui.styles import DARK_STYLE, LIGHT_STYLE
+from modbus_tool.ui.alarm_dialog import AlarmRuleDialog
 from modbus_tool.ui.widgets import GlassMenu, HorizontalTextSideTabBar, LivePlotWidget
 
 
@@ -130,10 +135,14 @@ class MainWindow(QMainWindow):
         self.poll_request = b""
         self.poll_sent_quantity = 0
         self.wave_recorder = WaveRecorder(max_rows=200_000)
+        self.alarm_rules: list[AlarmRule] = []
+        self.alarm_events: deque[AlarmEvent] = deque(maxlen=50_000)
+        self._alarm_rule_rows: dict[str, int] = {}
         self.export_worker: CsvExportWorker | None = None
         self._raw_pending: deque[str] = deque(maxlen=5000)
         self._overview_dirty = False
         self._wave_count_dirty = False
+        self._alarm_view_dirty = False
 
         self.setWindowTitle("Modbus Studio · RTU")
         self.resize(1360, 840)
@@ -255,18 +264,15 @@ class MainWindow(QMainWindow):
         tools = QHBoxLayout(toolbar)
         tools.setContentsMargins(14, 9, 10, 9)
         tools.setSpacing(6)
-        self.view_buttons: list[QPushButton] = []
-        for index, label in enumerate(("帧列表", "原始数据", "数据概览", "实时波形")):
-            button = QPushButton(label)
-            button.setCheckable(True)
-            button.clicked.connect(lambda _checked=False, i=index: self._switch_view(i))
-            self.view_buttons.append(button)
-            tools.addWidget(button)
-        self.view_buttons[0].setChecked(True)
+        self.view_tabs = QTabBar(objectName="mainViewTabs")
+        self.view_tabs.setDrawBase(False)
+        self.view_tabs.setExpanding(False)
+        self.view_tabs.setUsesScrollButtons(False)
+        for label in ("帧列表", "原始数据", "数据概览", "实时波形", "参数报警"):
+            self.view_tabs.addTab(label)
+        self.view_tabs.currentChanged.connect(self._switch_view)
+        tools.addWidget(self.view_tabs)
         tools.addStretch()
-        self.auto_scroll = QCheckBox("自动滚动")
-        self.auto_scroll.setChecked(True)
-        tools.addWidget(self.auto_scroll)
         pause = QPushButton("暂停")
         pause.setCheckable(True)
         pause.toggled.connect(self._toggle_display_pause)
@@ -282,10 +288,16 @@ class MainWindow(QMainWindow):
         self.views.addWidget(self._build_raw_view())
         self.views.addWidget(self._build_overview())
         self.views.addWidget(self._build_waveform_view())
+        self.views.addWidget(self._build_alarm_view())
         layout.addWidget(self.views, 1)
         return panel
 
     def _build_frame_view(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(10, 8, 10, 10)
+        page_layout.setSpacing(0)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.frame_model = QStandardItemModel(0, 7, self)
         self.frame_model.setHorizontalHeaderLabels(
@@ -321,7 +333,8 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self.detail_text)
         splitter.addWidget(detail)
         splitter.setSizes([560, 150])
-        return splitter
+        page_layout.addWidget(splitter, 1)
+        return page
 
     def _build_raw_view(self) -> QWidget:
         widget = QWidget()
@@ -514,6 +527,313 @@ class MainWindow(QMainWindow):
             self.export_worker.deleteLater()
             self.export_worker = None
 
+    def _build_alarm_view(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(9)
+
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.addWidget(QLabel("参数报警", objectName="sectionTitle"))
+        title_box.addWidget(QLabel("右键添加检测通道 · 只记录报警与恢复状态变化", objectName="muted"))
+        header.addLayout(title_box)
+        header.addStretch()
+        self.alarm_summary = QLabel("0 条规则 · 0 条活动报警 · 0 条事件", objectName="muted")
+        header.addWidget(self.alarm_summary)
+        self.alarm_add_button = QPushButton("添加报警")
+        self.alarm_add_button.clicked.connect(self._open_alarm_add_menu)
+        header.addWidget(self.alarm_add_button)
+        edit_button = QPushButton("编辑规则")
+        edit_button.clicked.connect(self._edit_selected_alarm_rule)
+        header.addWidget(edit_button)
+        delete_button = QPushButton("删除规则", objectName="danger")
+        delete_button.clicked.connect(self._delete_selected_alarm_rule)
+        header.addWidget(delete_button)
+        layout.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        rules_panel = QWidget()
+        rules_layout = QVBoxLayout(rules_panel)
+        rules_layout.setContentsMargins(0, 0, 0, 0)
+        rules_layout.addWidget(QLabel("检测规则", objectName="sectionTitle"))
+        self.alarm_rule_model = QStandardItemModel(0, 5, self)
+        self.alarm_rule_model.setHorizontalHeaderLabels(
+            ["检测通道", "报警条件", "当前值", "状态", "启用"]
+        )
+        self.alarm_rule_table = QTableView()
+        self.alarm_rule_table.setModel(self.alarm_rule_model)
+        self.alarm_rule_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.alarm_rule_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.alarm_rule_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.alarm_rule_table.setAlternatingRowColors(True)
+        self.alarm_rule_table.verticalHeader().hide()
+        self.alarm_rule_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.alarm_rule_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((2, 120), (3, 90), (4, 70)):
+            self.alarm_rule_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            self.alarm_rule_table.setColumnWidth(column, width)
+        self.alarm_rule_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.alarm_rule_table.customContextMenuRequested.connect(self._show_alarm_context_menu)
+        self.alarm_rule_table.doubleClicked.connect(self._edit_selected_alarm_rule)
+        rules_layout.addWidget(self.alarm_rule_table)
+        splitter.addWidget(rules_panel)
+
+        events_panel = QWidget()
+        events_layout = QVBoxLayout(events_panel)
+        events_layout.setContentsMargins(0, 0, 0, 0)
+        events_header = QHBoxLayout()
+        events_header.addWidget(QLabel("报警事件", objectName="sectionTitle"))
+        events_header.addStretch()
+        export_events = QPushButton("导出事件")
+        export_events.clicked.connect(self._export_alarm_events)
+        events_header.addWidget(export_events)
+        clear_events = QPushButton("清空事件", objectName="danger")
+        clear_events.clicked.connect(self._clear_alarm_events)
+        events_header.addWidget(clear_events)
+        events_layout.addLayout(events_header)
+        self.alarm_event_model = QStandardItemModel(0, 5, self)
+        self.alarm_event_model.setHorizontalHeaderLabels(
+            ["发生时间", "状态", "检测通道", "检测值", "报警条件"]
+        )
+        self.alarm_event_table = QTableView()
+        self.alarm_event_table.setModel(self.alarm_event_model)
+        self.alarm_event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.alarm_event_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.alarm_event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.alarm_event_table.setAlternatingRowColors(True)
+        self.alarm_event_table.verticalHeader().hide()
+        self.alarm_event_table.setColumnWidth(0, 175)
+        self.alarm_event_table.setColumnWidth(1, 80)
+        self.alarm_event_table.setColumnWidth(3, 120)
+        self.alarm_event_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.alarm_event_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.alarm_event_table.selectionModel().selectionChanged.connect(self._show_alarm_event_detail)
+        events_layout.addWidget(self.alarm_event_table, 1)
+        self.alarm_event_detail = QPlainTextEdit()
+        self.alarm_event_detail.setReadOnly(True)
+        self.alarm_event_detail.setMaximumHeight(118)
+        self.alarm_event_detail.setPlaceholderText("选择一条报警事件，查看发生时间、检测值和原始 RTU 帧")
+        events_layout.addWidget(self.alarm_event_detail)
+        splitter.addWidget(events_panel)
+        splitter.setSizes([250, 430])
+        layout.addWidget(splitter, 1)
+        return page
+
+    def _alarm_channels(self) -> list[tuple[dict, int, str]]:
+        channels = []
+        for config in self.parsers:
+            for index in sorted(config["enabled"]):
+                channels.append((config, index, self._series_name(config, index)))
+        return channels
+
+    def _populate_alarm_channel_menu(self, menu: QMenu) -> None:
+        channels = self._alarm_channels()
+        if not channels:
+            action = menu.addAction("请先添加解析通道")
+            action.setEnabled(False)
+            return
+        grouped: dict[int, QMenu] = {}
+        for config, index, channel in channels:
+            target = menu
+            if config["count"] > 1:
+                key = id(config)
+                if key not in grouped:
+                    grouped[key] = menu.addMenu(config["name"])
+                target = grouped[key]
+            label = config["members"][index] if config["count"] > 1 else channel
+            action = target.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, selected=channel: self._edit_alarm_rule(selected)
+            )
+
+    def _open_alarm_add_menu(self) -> None:
+        menu = GlassMenu(self)
+        self._populate_alarm_channel_menu(menu)
+        menu.exec(self.alarm_add_button.mapToGlobal(self.alarm_add_button.rect().bottomLeft()))
+
+    def _show_alarm_context_menu(self, position) -> None:
+        menu = GlassMenu(self)
+        add_menu = menu.addMenu("添加检测通道")
+        self._populate_alarm_channel_menu(add_menu)
+        rule = self._selected_alarm_rule()
+        menu.addSeparator()
+        edit_action = menu.addAction("编辑所选规则")
+        toggle_action = menu.addAction("停用规则" if rule and rule.enabled else "启用规则")
+        delete_action = menu.addAction("删除所选规则")
+        for action in (edit_action, toggle_action, delete_action):
+            action.setEnabled(rule is not None)
+        chosen = menu.exec(self.alarm_rule_table.viewport().mapToGlobal(position))
+        if chosen == edit_action:
+            self._edit_selected_alarm_rule()
+        elif chosen == toggle_action and rule is not None:
+            rule.enabled = not rule.enabled
+            rule.active = False
+            rule.active_since = None
+            self._rebuild_alarm_rule_table()
+        elif chosen == delete_action:
+            self._delete_selected_alarm_rule()
+
+    def _selected_alarm_rule(self) -> AlarmRule | None:
+        rows = self.alarm_rule_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.alarm_rule_model.item(rows[0].row(), 0)
+        rule_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return next((rule for rule in self.alarm_rules if rule.rule_id == rule_id), None)
+
+    def _edit_alarm_rule(self, channel: str, rule: AlarmRule | None = None) -> None:
+        dialog = AlarmRuleDialog(channel, rule, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result_rule is None:
+            return
+        if rule is None:
+            self.alarm_rules.append(dialog.result_rule)
+        else:
+            index = self.alarm_rules.index(rule)
+            self.alarm_rules[index] = dialog.result_rule
+        self._rebuild_alarm_rule_table()
+
+    def _edit_selected_alarm_rule(self, *_args) -> None:
+        rule = self._selected_alarm_rule()
+        if rule is not None:
+            self._edit_alarm_rule(rule.channel, rule)
+
+    def _delete_selected_alarm_rule(self) -> None:
+        rule = self._selected_alarm_rule()
+        if rule is None:
+            return
+        self.alarm_rules.remove(rule)
+        self._rebuild_alarm_rule_table()
+
+    def _rebuild_alarm_rule_table(self) -> None:
+        self.alarm_rule_model.removeRows(0, self.alarm_rule_model.rowCount())
+        self._alarm_rule_rows.clear()
+        for row, rule in enumerate(self.alarm_rules):
+            current = "—" if rule.current_value is None else f"{rule.current_value:.10g}"
+            state = "已停用" if not rule.enabled else (
+                "报警" if rule.active else ("正常" if rule.current_value is not None else "等待数据")
+            )
+            items = [
+                QStandardItem(rule.channel), QStandardItem(rule.condition_text),
+                QStandardItem(current), QStandardItem(state),
+                QStandardItem("是" if rule.enabled else "否"),
+            ]
+            items[0].setData(rule.rule_id, Qt.ItemDataRole.UserRole)
+            color = QColor("#e34d59" if rule.active else ("#209567" if rule.enabled else "#8a96a6"))
+            for item in items:
+                item.setForeground(color)
+            self.alarm_rule_model.appendRow(items)
+            self._alarm_rule_rows[rule.rule_id] = row
+        self._refresh_alarm_summary()
+
+    def _flush_alarm_rule_values(self) -> None:
+        self._alarm_view_dirty = False
+        for rule in self.alarm_rules:
+            row = self._alarm_rule_rows.get(rule.rule_id)
+            if row is None:
+                continue
+            current = "—" if rule.current_value is None else f"{rule.current_value:.10g}"
+            state = "已停用" if not rule.enabled else (
+                "报警" if rule.active else ("正常" if rule.current_value is not None else "等待数据")
+            )
+            color = QColor("#e34d59" if rule.active else ("#209567" if rule.enabled else "#8a96a6"))
+            for column, text in ((2, current), (3, state), (4, "是" if rule.enabled else "否")):
+                item = self.alarm_rule_model.item(row, column)
+                if item and item.text() != text:
+                    item.setText(text)
+            for column in range(self.alarm_rule_model.columnCount()):
+                item = self.alarm_rule_model.item(row, column)
+                if item:
+                    item.setForeground(color)
+
+    def _evaluate_alarms(self, channel: str, value: float | int, frame: RtuFrame) -> None:
+        raw_frame = hex_text(frame.raw)
+        for rule in self.alarm_rules:
+            if rule.channel != channel:
+                continue
+            event = rule.evaluate(float(value), frame.timestamp, raw_frame)
+            self._alarm_view_dirty = True
+            if event is not None:
+                self._record_alarm_event(event)
+
+    def _record_alarm_event(self, event: AlarmEvent) -> None:
+        self.alarm_events.append(event)
+        state = "报警" if event.state == "active" else "恢复"
+        items = [
+            QStandardItem(event.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]),
+            QStandardItem(state), QStandardItem(event.channel),
+            QStandardItem(f"{event.value:.10g}"), QStandardItem(event.condition),
+        ]
+        items[0].setData(event, Qt.ItemDataRole.UserRole)
+        color = QColor("#e34d59" if event.state == "active" else "#209567")
+        for item in items:
+            item.setForeground(color)
+        self.alarm_event_model.insertRow(0, items)
+        while self.alarm_event_model.rowCount() > 10_000:
+            self.alarm_event_model.removeRow(self.alarm_event_model.rowCount() - 1)
+        self._refresh_alarm_summary()
+
+    def _show_alarm_event_detail(self) -> None:
+        rows = self.alarm_event_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        item = self.alarm_event_model.item(rows[0].row(), 0)
+        event = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(event, AlarmEvent):
+            return
+        state = "进入报警" if event.state == "active" else "恢复正常"
+        duration = (
+            f"\n持续时间  {event.duration_ms:.1f} ms"
+            if event.duration_ms is not None else ""
+        )
+        self.alarm_event_detail.setPlainText(
+            f"发生时间  {event.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
+            f"事件状态  {state}\n检测通道  {event.channel}\n"
+            f"检测值    {event.value:.12g}\n报警条件  {event.condition}"
+            f"{duration}\n原始帧    {event.raw_frame}"
+        )
+
+    def _refresh_alarm_summary(self) -> None:
+        if not hasattr(self, "alarm_summary"):
+            return
+        active = sum(1 for rule in self.alarm_rules if rule.enabled and rule.active)
+        self.alarm_summary.setText(
+            f"{len(self.alarm_rules)} 条规则 · {active} 条活动报警 · {len(self.alarm_events)} 条事件"
+        )
+
+    def _clear_alarm_events(self) -> None:
+        self.alarm_events.clear()
+        self.alarm_event_model.removeRows(0, self.alarm_event_model.rowCount())
+        self.alarm_event_detail.clear()
+        self._refresh_alarm_summary()
+        self.status_label.setText("报警事件记录已清空，检测规则保持不变")
+
+    def _export_alarm_events(self) -> None:
+        if not self.alarm_events:
+            QMessageBox.information(self, "没有报警事件", "当前没有可导出的报警事件。")
+            return
+        default_name = datetime.now().strftime("modbus_alarm_%Y%m%d_%H%M%S.csv")
+        target, _ = QFileDialog.getSaveFileName(self, "导出报警事件", default_name, "CSV 文件 (*.csv)")
+        if not target:
+            return
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+        try:
+            with Path(target).open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["timestamp", "state", "channel", "value", "condition", "duration_ms", "raw_frame"])
+                for event in self.alarm_events:
+                    writer.writerow([
+                        event.timestamp.isoformat(sep=" ", timespec="milliseconds"),
+                        event.state, event.channel, event.value, event.condition,
+                        "" if event.duration_ms is None else f"{event.duration_ms:.3f}",
+                        event.raw_frame,
+                    ])
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.status_label.setText(f"报警事件已导出：{target}")
+
     def _build_right_tabs(self) -> QWidget:
         self.right_tabs = QTabWidget()
         # The tab stack is vertical on the right, but labels are custom-painted horizontally.
@@ -521,9 +841,8 @@ class MainWindow(QMainWindow):
         self.right_tabs.setTabPosition(QTabWidget.TabPosition.East)
         self.right_tabs.setMinimumWidth(500)
         self.right_tabs.setMaximumWidth(650)
-        self.receive_page = self._build_receive_tab()
-        self.right_tabs.addTab(self.receive_page, "接收")
-        self.right_tabs.addTab(self._build_poll_tab(), "轮询")
+        self.poll_page = self._build_poll_tab()
+        self.right_tabs.addTab(self.poll_page, "轮询")
         self.parse_page = self._build_parse_tab()
         self.right_tabs.addTab(self.parse_page, "解析")
         self.write_page = self._build_write_tab()
@@ -545,55 +864,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         scroll.setWidget(page)
         return scroll, layout
-
-    def _build_receive_tab(self) -> QWidget:
-        page, layout = self._tab_page()
-        layout.addWidget(QLabel("接收过滤", objectName="sectionTitle"))
-        layout.addWidget(QLabel("只影响显示，不丢弃底层数据", objectName="muted"))
-        form = QFormLayout()
-        self.filter_address = QSpinBox()
-        self.filter_address.setRange(0, 247)
-        self.filter_address.setSpecialValueText("全部")
-        self.filter_address.valueChanged.connect(self._apply_filters)
-        form.addRow("从站地址", self.filter_address)
-        self.filter_function = QComboBox()
-        self.filter_function.addItem("全部功能码", -1)
-        for text, code in FUNCTION_OPTIONS:
-            self.filter_function.addItem(text, code)
-        self.filter_function.currentIndexChanged.connect(self._apply_filters)
-        form.addRow("功能码", self.filter_function)
-        self.filter_crc = QComboBox()
-        self.filter_crc.addItems(["全部", "仅 CRC 正确", "仅 CRC 异常"])
-        self.filter_crc.currentIndexChanged.connect(self._apply_filters)
-        form.addRow("CRC 状态", self.filter_crc)
-        self.filter_keyword = QLineEdit()
-        self.filter_keyword.setPlaceholderText("搜索 HEX / 摘要")
-        self.filter_keyword.textChanged.connect(self._apply_filters)
-        form.addRow("关键字", self.filter_keyword)
-        layout.addLayout(form)
-
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("显示偏好", objectName="sectionTitle"))
-        self.show_timestamp = QCheckBox("显示毫秒时间戳")
-        self.show_timestamp.setChecked(True)
-        self.uppercase_hex = QCheckBox("HEX 使用大写")
-        self.uppercase_hex.setChecked(True)
-        self.keep_limit = QSpinBox()
-        self.keep_limit.setRange(100, 100000)
-        self.keep_limit.setValue(5000)
-        self.keep_limit.setSuffix(" 帧")
-        layout.addWidget(self.show_timestamp)
-        layout.addWidget(self.uppercase_hex)
-        limit_row = QHBoxLayout()
-        limit_row.addWidget(QLabel("缓存上限"))
-        limit_row.addWidget(self.keep_limit)
-        layout.addLayout(limit_row)
-        layout.addStretch()
-        tip = QLabel("提示  CRC 异常常由波特率、校验位或 RTU 分帧间隔不匹配引起。")
-        tip.setWordWrap(True)
-        tip.setStyleSheet("background:#12252a;color:#72cfc1;padding:10px;border-radius:7px")
-        layout.addWidget(tip)
-        return page
 
     def _build_poll_tab(self) -> QWidget:
         page, layout = self._tab_page()
@@ -777,7 +1047,7 @@ class MainWindow(QMainWindow):
         parser_actions = QHBoxLayout()
         parser_actions.addWidget(remove_parser, 1)
         clear_parsers = QPushButton("清空所有通道", objectName="danger")
-        clear_parsers.setToolTip("删除全部解析变量、结构和波形绑定")
+        clear_parsers.setToolTip("删除全部解析变量、波形绑定和报警规则")
         clear_parsers.clicked.connect(self._clear_all_parsers)
         parser_actions.addWidget(clear_parsers)
         layout.addLayout(parser_actions)
@@ -1189,9 +1459,28 @@ class MainWindow(QMainWindow):
         description.setObjectName("muted")
         layout.addWidget(description)
         layout.addSpacing(18)
+        layout.addWidget(QLabel("数据显示", objectName="sectionTitle"))
+        display_hint = QLabel("只改变界面呈现和内存缓存，不影响串口接收与解析。", objectName="muted")
+        display_hint.setWordWrap(True)
+        layout.addWidget(display_hint)
+        self.show_timestamp = QCheckBox("帧列表显示毫秒时间戳")
+        self.show_timestamp.setChecked(True)
+        self.uppercase_hex = QCheckBox("HEX 使用大写字母")
+        self.uppercase_hex.setChecked(True)
+        layout.addWidget(self.show_timestamp)
+        layout.addWidget(self.uppercase_hex)
+        limit_row = QHBoxLayout()
+        limit_row.addWidget(QLabel("帧缓存上限"))
+        self.keep_limit = QSpinBox()
+        self.keep_limit.setRange(100, 100000)
+        self.keep_limit.setValue(5000)
+        self.keep_limit.setSuffix(" 帧")
+        limit_row.addWidget(self.keep_limit, 1)
+        layout.addLayout(limit_row)
+        layout.addSpacing(18)
         layout.addWidget(QLabel("工程 JSON", objectName="sectionTitle"))
         project_hint = QLabel(
-            "导出当前串口、轮询、解析、波形绑定和界面配置。JSON 可直接交给 AI 修改，再一键导入还原。"
+            "导出当前串口、轮询、解析、波形绑定、报警规则和界面配置。JSON 可直接交给 AI 修改，再一键导入还原。"
         )
         project_hint.setWordWrap(True)
         project_hint.setObjectName("muted")
@@ -1220,8 +1509,8 @@ class MainWindow(QMainWindow):
 
     def _project_document(self) -> dict:
         """Capture configuration only; live samples and running state are excluded."""
-        view_names = ("frames", "raw", "overview", "waveform")
-        tab_names = ("receive", "poll", "parse", "write", "builder", "serial", "settings")
+        view_names = ("frames", "raw", "overview", "waveform", "alarms")
+        tab_names = ("poll", "parse", "write", "builder", "serial", "settings")
         parser_documents = []
         for config in self.parsers:
             parser_documents.append({
@@ -1263,15 +1552,18 @@ class MainWindow(QMainWindow):
                 "timeout_ms": self.poll_timeout.value(),
             },
             "parsers": parser_documents,
+            "alarms": [rule.to_document() for rule in self.alarm_rules],
             "parser_sequence": self._parser_sequence,
             "receive": {
-                "address_filter": self.filter_address.value(),
-                "function_filter": self.filter_function.currentData(),
-                "crc_filter": self.filter_crc.currentIndex(),
-                "keyword": self.filter_keyword.text(),
+                # Retained in the file format so older project JSON remains compatible.
+                "address_filter": 0,
+                "function_filter": -1,
+                "crc_filter": 0,
+                "keyword": "",
                 "show_timestamp": self.show_timestamp.isChecked(),
                 "uppercase_hex": self.uppercase_hex.isChecked(),
-                "auto_scroll": self.auto_scroll.isChecked(),
+                # Retained for compatibility with older project files.
+                "auto_scroll": False,
                 "keep_limit": self.keep_limit.value(),
             },
             "write": {
@@ -1399,13 +1691,8 @@ class MainWindow(QMainWindow):
         self.poll_timeout.setValue(poll["timeout_ms"])
 
         receive = document["receive"]
-        self.filter_address.setValue(receive["address_filter"])
-        self._set_combo_data(self.filter_function, receive["function_filter"], "receive.function_filter")
-        self.filter_crc.setCurrentIndex(receive["crc_filter"])
-        self.filter_keyword.setText(receive["keyword"])
         self.show_timestamp.setChecked(receive["show_timestamp"])
         self.uppercase_hex.setChecked(receive["uppercase_hex"])
-        self.auto_scroll.setChecked(receive["auto_scroll"])
         self.keep_limit.setValue(receive["keep_limit"])
 
         self._clear_all_parsers()
@@ -1427,6 +1714,11 @@ class MainWindow(QMainWindow):
                 for index in members:
                     self._register_parser_member(config, index, view)
             self._refresh_parser_binding_text(config)
+
+        self.alarm_rules = [
+            AlarmRule.from_document(saved) for saved in document.get("alarms", [])
+        ]
+        self._rebuild_alarm_rule_table()
 
         write = document["write"]
         self.write_address.setValue(write["address"])
@@ -1451,9 +1743,9 @@ class MainWindow(QMainWindow):
 
         ui = document["ui"]
         self._set_combo_data(self.theme_combo, ui["theme"], "ui.theme")
-        main_views = {"frames": 0, "raw": 1, "overview": 2, "waveform": 3}
-        right_tabs = {"receive": 0, "poll": 1, "parse": 2, "write": 3,
-                      "builder": 4, "serial": 5, "settings": 6}
+        main_views = {"frames": 0, "raw": 1, "overview": 2, "waveform": 3, "alarms": 4}
+        right_tabs = {"receive": 0, "poll": 0, "parse": 1, "write": 2,
+                      "builder": 3, "serial": 4, "settings": 5}
         self._switch_view(main_views[ui["main_view"]])
         self.right_tabs.setCurrentIndex(right_tabs[ui["right_tab"]])
         self.resize(ui["window_size"]["width"], ui["window_size"]["height"])
@@ -1470,12 +1762,12 @@ class MainWindow(QMainWindow):
 
     def _switch_view(self, index: int) -> None:
         self.views.setCurrentIndex(index)
-        for i, button in enumerate(self.view_buttons):
-            button.setChecked(i == index)
+        if self.view_tabs.currentIndex() != index:
+            self.view_tabs.setCurrentIndex(index)
         # One-shot contextual navigation: users can freely change the right tab afterwards.
         if not hasattr(self, "right_tabs"):
             return
-        target_page = self.receive_page if index in (0, 1) else self.parse_page
+        target_page = self.poll_page if index in (0, 1) else self.parse_page
         self.right_tabs.setCurrentWidget(target_page)
 
     def refresh_ports(self, manual: bool = False) -> None:
@@ -1619,6 +1911,8 @@ class MainWindow(QMainWindow):
             else:
                 self.bad_frames += 1
             if direction == "RX":
+                if frame.crc_ok:
+                    self._parse_frame_channels(frame, update_display=False)
                 if not self._handle_write_response(frame):
                     self._handle_poll_response(frame)
             return
@@ -1690,9 +1984,6 @@ class MainWindow(QMainWindow):
         if direction == "RX":
             if not self._handle_write_response(frame):
                 self._handle_poll_response(frame)
-        if self.auto_scroll.isChecked():
-            if not poll_slot:
-                self.frame_table.scrollToBottom()
         self._overview_dirty = True
         self._set_label_text(self.recent_address, address)
         self._set_label_text(self.recent_function, function)
@@ -1712,14 +2003,14 @@ class MainWindow(QMainWindow):
         pending = list(self._raw_pending)
         self._raw_pending.clear()
         self.raw_text.appendPlainText("\n".join(pending))
-        if self.auto_scroll.isChecked():
-            scrollbar = self.raw_text.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
 
     def _flush_overview(self) -> None:
         if self._wave_count_dirty:
             self._wave_count_dirty = False
             self.wave_record_count.setText(f"已记录 {len(self.wave_recorder):,} 行")
+        if self._alarm_view_dirty:
+            self._flush_alarm_rule_values()
+            self._refresh_alarm_summary()
         if not self._overview_dirty:
             return
         self._overview_dirty = False
@@ -1796,10 +2087,12 @@ class MainWindow(QMainWindow):
         self.byte_overview.setPlainText("\n".join(lines))
 
     def _apply_filters(self) -> None:
-        self.frame_filter.address = -1 if self.filter_address.value() == 0 else self.filter_address.value()
-        self.frame_filter.function = self.filter_function.currentData()
-        self.frame_filter.crc_mode = self.filter_crc.currentIndex()
-        self.frame_filter.keyword = self.filter_keyword.text().strip().lower()
+        # The app targets one device at a time, so the frame list always shows
+        # the complete traffic stream. Legacy project filters are intentionally ignored.
+        self.frame_filter.address = -1
+        self.frame_filter.function = -1
+        self.frame_filter.crc_mode = 0
+        self.frame_filter.keyword = ""
         self.frame_filter.invalidateFilter()
 
     def _toggle_polling(self) -> None:
@@ -2190,19 +2483,26 @@ class MainWindow(QMainWindow):
         self.parser_tree.clear()
         for plot in self.live_plots:
             plot.clear_all_series()
+        self.alarm_rules.clear()
+        self._rebuild_alarm_rule_table()
         self.wave_recorder.clear()
         self._wave_count_dirty = False
         self.wave_record_count.setText("已记录 0 行")
-        self.status_label.setText("已清空全部解析通道和波形绑定")
+        self.status_label.setText("已清空全部解析通道、波形绑定和报警规则")
 
     def _remove_parser_item(self, config: dict, member: int) -> None:
         if member < 0 or config["count"] == 1:
+            removed_channels = {
+                self._series_name(config, index) for index in range(config["count"])
+            }
             self.parsers.remove(config)
             self.parser_tree.takeTopLevelItem(self.parser_tree.indexOfTopLevelItem(config["item"]))
             for plot in self.live_plots:
                 plot.remove_series(config["name"])
+            self._remove_alarm_rules_for_channels(removed_channels)
             self.status_label.setText(f"已删除解析结构“{config['name']}”")
             return
+        removed_channel = self._series_name(config, member)
         config["enabled"].discard(member)
         config["plots"].discard(member)
         for view, plot in enumerate(self.live_plots):
@@ -2210,6 +2510,7 @@ class MainWindow(QMainWindow):
             plot.remove_series(self._series_name(config, member))
         item = config["member_items"].pop(member)
         config["item"].removeChild(item)
+        self._remove_alarm_rules_for_channels({removed_channel})
         self._refresh_parser_binding_text(config)
         self.status_label.setText(f"已删除成员“{config['members'][member]}”")
 
@@ -2225,7 +2526,7 @@ class MainWindow(QMainWindow):
         new_name = new_name.strip()
         if not accepted or not new_name or new_name == old_name:
             return
-        old_series = {index: self._series_name(config, index) for index in config["plots"]}
+        old_series = {index: self._series_name(config, index) for index in range(config["count"])}
         if member < 0 or is_single:
             config["name"] = new_name
             if is_single:
@@ -2235,11 +2536,22 @@ class MainWindow(QMainWindow):
             config["members"][member] = new_name
             config["member_items"][member].setText(0, new_name)
         for index, previous_name in old_series.items():
+            current_name = self._series_name(config, index)
             for plot in self.live_plots:
-                plot.rename_series(previous_name, self._series_name(config, index))
+                plot.rename_series(previous_name, current_name)
+            for rule in self.alarm_rules:
+                if rule.channel == previous_name:
+                    rule.channel = current_name
+        self._rebuild_alarm_rule_table()
         self.status_label.setText(f"已重命名为“{new_name}”")
 
-    def _parse_frame_channels(self, frame: RtuFrame) -> None:
+    def _remove_alarm_rules_for_channels(self, channels: set[str]) -> None:
+        if not channels:
+            return
+        self.alarm_rules = [rule for rule in self.alarm_rules if rule.channel not in channels]
+        self._rebuild_alarm_rule_table()
+
+    def _parse_frame_channels(self, frame: RtuFrame, update_display: bool = True) -> None:
         waveform_values: dict[str, float | int] = {}
         for config in self.parsers:
             if config["address"] and frame.address != config["address"]:
@@ -2261,6 +2573,8 @@ class MainWindow(QMainWindow):
                     config["scale"],
                 )
             except ValueError as exc:
+                if not update_display:
+                    continue
                 message = f"等待数据 · {exc}"
                 self._set_tree_text(config["item"], 2, "等待数据")
                 if config["item"].toolTip(2) != message:
@@ -2270,20 +2584,22 @@ class MainWindow(QMainWindow):
                     if item.toolTip(2) != message:
                         item.setToolTip(2, message)
                 continue
-            display = ", ".join(f"{value:.6g}" if isinstance(value, float) else str(value) for value in values)
-            self._set_tree_text(config["item"], 2, display if len(display) < 48 else display[:47] + "…")
-            if config["item"].toolTip(2) != display:
-                config["item"].setToolTip(2, display)
+            if update_display:
+                display = ", ".join(f"{value:.6g}" if isinstance(value, float) else str(value) for value in values)
+                self._set_tree_text(config["item"], 2, display if len(display) < 48 else display[:47] + "…")
+                if config["item"].toolTip(2) != display:
+                    config["item"].setToolTip(2, display)
             for index, value in enumerate(values):
                 if index not in config["enabled"]:
                     continue
                 item = config["member_items"].get(index)
-                if item:
+                if update_display and item:
                     self._set_tree_text(item, 2, f"{value:.8g}" if isinstance(value, float) else str(value))
                     if item.toolTip(2):
                         item.setToolTip(2, "")
-                if index in config["plots"]:
-                    series_name = self._series_name(config, index)
+                series_name = self._series_name(config, index)
+                self._evaluate_alarms(series_name, value, frame)
+                if update_display and index in config["plots"]:
                     color_index = (self.parsers.index(config) + index) % len(self.parser_colors)
                     for view, members in enumerate(config["plot_views"]):
                         if index in members:
@@ -2291,7 +2607,7 @@ class MainWindow(QMainWindow):
                                 series_name, float(value), self.parser_colors[color_index]
                             )
                     waveform_values[series_name] = value
-        if waveform_values:
+        if update_display and waveform_values:
             self.wave_recorder.append(frame.timestamp, waveform_values)
             self._wave_count_dirty = True
 

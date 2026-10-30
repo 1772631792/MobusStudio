@@ -32,6 +32,10 @@ QTabBar::tab { background: rgba(232, 237, 242, 220); color: #657387; padding: 11
 QTabBar::tab:first { border-top-left-radius: 10px; }
 QTabBar::tab:last { border-top-right-radius: 10px; }
 QTabBar::tab:selected { color: #0877bb; background: rgba(255, 255, 255, 240); border-bottom: 2px solid #08b9a1; font-weight: 700; }
+QTabBar#mainViewTabs { background: #e3e9ef; border: 1px solid #d2dbe5; border-radius: 11px; padding: 3px; }
+QTabBar#mainViewTabs::tab { background: transparent; border: none; border-radius: 8px; padding: 8px 16px; margin: 0 1px; min-width: 64px; }
+QTabBar#mainViewTabs::tab:selected { background: #ffffff; color: #0877bb; font-weight: 700; }
+QTabBar#mainViewTabs::tab:hover:!selected { background: #edf3f7; color: #276d99; }
 QTableView { background: #ffffff; alternate-background-color: #f7f9fb; border: none; gridline-color: #e6eaf0; selection-background-color: #dceff8; selection-color: #174d6c; }
 QHeaderView::section { background: #f1f4f7; color: #5f6c7d; border: none; border-bottom: 1px solid #dce2e9; padding: 8px; font-weight: 650; }
 QPlainTextEdit, QTextEdit { background: #ffffff; border: none; color: #344459; selection-background-color: #bee3f3; font-family: Consolas, 'Cascadia Mono'; }
@@ -77,6 +81,10 @@ QCheckBox::indicator:checked { background: #00bfa5; border-color: #00bfa5; }
 QTabWidget::pane { border: 1px solid #202d3f; background: rgba(16, 24, 36, 225); border-radius: 12px; top: -1px; }
 QTabBar::tab { background: rgba(16, 23, 35, 220); color: #8290a3; padding: 11px 15px; min-width: 50px; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #23d5bc; background: rgba(22, 34, 50, 240); border-bottom: 2px solid #23d5bc; }
+QTabBar#mainViewTabs { background: #111b29; border: 1px solid #26364b; border-radius: 11px; padding: 3px; }
+QTabBar#mainViewTabs::tab { background: transparent; border: none; border-radius: 8px; padding: 8px 16px; margin: 0 1px; min-width: 64px; }
+QTabBar#mainViewTabs::tab:selected { background: #203047; color: #23d5bc; font-weight: 700; }
+QTabBar#mainViewTabs::tab:hover:!selected { background: #182538; color: #b8c8db; }
 QTableView { background: #0e1520; alternate-background-color: #111b29; border: none; gridline-color: #1b2636; selection-background-color: #183b42; selection-color: #eafffb; }
 QHeaderView::section { background: #141e2c; color: #8190a5; border: none; border-bottom: 1px solid #233146; padding: 8px; font-weight: 600; }
 QPlainTextEdit, QTextEdit { background: #0a1019; border: none; color: #b8c8db; selection-background-color: #155e56; font-family: Consolas, 'Cascadia Mono'; }
