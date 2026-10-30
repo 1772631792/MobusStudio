@@ -73,3 +73,24 @@ def test_project_validation_rejects_plot_for_deleted_member():
     document["parsers"][0]["enabled"] = [1]
     with pytest.raises(ValueError, match="plots"):
         validate_project(document)
+
+
+def test_project_validation_accepts_two_wave_views():
+    document = sample_project()
+    document["parsers"][0]["plot_views"] = [[0], [1]]
+    document["parsers"][0]["plots"] = [0, 1]
+    document["ui"]["wave_views"] = [
+        {"x_zoom": 1.0, "y_zoom": 1.0},
+        {"x_zoom": 2.0, "y_zoom": 0.5},
+    ]
+    document["ui"]["active_wave_view"] = 1
+    result = validate_project(document)
+    assert result["parsers"][0]["plot_views"] == [[0], [1]]
+    assert result["ui"]["active_wave_view"] == 1
+
+
+def test_project_validation_rejects_inconsistent_wave_view_bindings():
+    document = sample_project()
+    document["parsers"][0]["plot_views"] = [[], []]
+    with pytest.raises(ValueError, match="并集"):
+        validate_project(document)

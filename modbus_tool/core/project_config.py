@@ -108,6 +108,24 @@ def validate_project(document: object) -> dict:
                 raise ValueError(f"{path}.{key} 不能包含重复序号")
         if not set(parser["plots"]).issubset(set(parser["enabled"])):
             raise ValueError(f"{path}.plots 只能绑定 enabled 中的成员")
+        if "plot_views" in parser:
+            plot_views = parser["plot_views"]
+            if not isinstance(plot_views, list) or len(plot_views) != 2:
+                raise ValueError(f"{path}.plot_views 必须包含波形 A、B 两个成员数组")
+            view_union: set[int] = set()
+            for view_index, members_in_view in enumerate(plot_views):
+                if not isinstance(members_in_view, list) or any(
+                    isinstance(item, bool) or not isinstance(item, int) or not 0 <= item < count
+                    for item in members_in_view
+                ):
+                    raise ValueError(f"{path}.plot_views[{view_index}] 必须是有效成员序号数组")
+                if len(members_in_view) != len(set(members_in_view)):
+                    raise ValueError(f"{path}.plot_views[{view_index}] 不能包含重复序号")
+                if not set(members_in_view).issubset(set(parser["enabled"])):
+                    raise ValueError(f"{path}.plot_views[{view_index}] 只能绑定 enabled 中的成员")
+                view_union.update(members_in_view)
+            if view_union != set(parser["plots"]):
+                raise ValueError(f"{path}.plots 必须等于 plot_views 中成员的并集")
         for index in parser["enabled"]:
             series = name if count == 1 else f"{name}.{members[index]}"
             if series in series_names:
@@ -142,6 +160,18 @@ def validate_project(document: object) -> dict:
     y_zoom = _number(wave.get("y_zoom"), "ui.wave_view.y_zoom")
     if not 0.2 <= x_zoom <= 25 or not 0.2 <= y_zoom <= 50:
         raise ValueError("ui.wave_view 的缩放值超出范围")
+    if "wave_views" in ui:
+        wave_views = ui["wave_views"]
+        if not isinstance(wave_views, list) or len(wave_views) != 2:
+            raise ValueError("ui.wave_views 必须包含波形 A、B 两个视图")
+        for index, state in enumerate(wave_views):
+            state = _mapping(state, f"ui.wave_views[{index}]")
+            x_zoom = _number(state.get("x_zoom"), f"ui.wave_views[{index}].x_zoom")
+            y_zoom = _number(state.get("y_zoom"), f"ui.wave_views[{index}].y_zoom")
+            if not 0.2 <= x_zoom <= 25 or not 0.2 <= y_zoom <= 50:
+                raise ValueError(f"ui.wave_views[{index}] 的缩放值超出范围")
+    if "active_wave_view" in ui:
+        _integer(ui["active_wave_view"], "ui.active_wave_view", 0, 1)
 
     write = _mapping(root.get("write"), "write")
     _integer(write.get("address"), "write.address", 1, 247)

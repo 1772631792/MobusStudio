@@ -29,7 +29,7 @@ def main() -> int:
     icon_path = resource_path("resources/modbus_studio.png")
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
-    app.setFont(QFont("Microsoft YaHei UI", 12))
+    app.setFont(QFont("Microsoft YaHei UI", 13))
     app.setStyle("Fusion")
     app.setStyleSheet(LIGHT_STYLE)
 

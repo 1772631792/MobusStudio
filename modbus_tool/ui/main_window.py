@@ -59,7 +59,7 @@ from modbus_tool.core.serial_worker import SerialWorker
 from modbus_tool.core.settings import Settings
 from modbus_tool.core.wave_recorder import CsvExportWorker, WaveRecorder
 from modbus_tool.ui.styles import DARK_STYLE, LIGHT_STYLE
-from modbus_tool.ui.widgets import HorizontalTextSideTabBar, LivePlotWidget
+from modbus_tool.ui.widgets import GlassMenu, HorizontalTextSideTabBar, LivePlotWidget
 
 
 FUNCTION_OPTIONS = [
@@ -203,10 +203,11 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(16, 10, 12, 10)
 
-        logo = QLabel("M")
+        logo = QLabel()
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setFixedSize(34, 34)
-        logo.setStyleSheet("background:#00bfa5;color:#06201c;border-radius:9px;font-size:18px;font-weight:900")
+        logo.setFixedSize(40, 40)
+        logo.setPixmap(QApplication.windowIcon().pixmap(40, 40))
+        logo.setToolTip("Modbus Studio")
         layout.addWidget(logo)
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
@@ -371,15 +372,27 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.addWidget(QLabel("实时数据波形", objectName="sectionTitle"))
-        title_box.addWidget(QLabel("进入本页会打开“解析”，右键通道即可绑定波形", objectName="muted"))
+        title_box.addWidget(QLabel("波形 A / B 独立绑定 · 在绘图区右键选择解析成员", objectName="muted"))
         header.addLayout(title_box)
         header.addStretch()
         self.wave_record_count = QLabel("已记录 0 行", objectName="muted")
         header.addWidget(self.wave_record_count)
-        self.live_plot = LivePlotWidget()
+        self.wave_tabs = QTabWidget()
+        self.live_plots = [LivePlotWidget(), LivePlotWidget()]
+        for index, plot in enumerate(self.live_plots):
+            self.wave_tabs.addTab(plot, f"波形 {'AB'[index]}")
+            plot.viewport_changed.connect(
+                lambda text, view=index: self._wave_viewport_changed(view, text)
+            )
+            plot.binding_menu_requested.connect(
+                lambda menu, view=index: self._populate_wave_binding_menu(menu, view)
+            )
+        # Keep the original attribute for old project files and third-party code.
+        self.live_plot = self.live_plots[0]
+        self.wave_tabs.currentChanged.connect(self._wave_tab_changed)
         reset_plot = QPushButton("适应视图")
         reset_plot.setToolTip("恢复自动量程并回到最新数据；也可在绘图区双击")
-        reset_plot.clicked.connect(self.live_plot.reset_view)
+        reset_plot.clicked.connect(lambda: self._active_live_plot().reset_view())
         self.export_csv_button = QPushButton("导出 CSV")
         self.export_csv_button.clicked.connect(self._export_wave_csv)
         header.addWidget(self.export_csv_button)
@@ -388,18 +401,50 @@ class MainWindow(QMainWindow):
         header.addWidget(clear_plot)
         header.insertWidget(header.count() - 2, reset_plot)
         layout.addLayout(header)
-        layout.addWidget(self.live_plot, 1)
+        layout.addWidget(self.wave_tabs, 1)
         interaction = QHBoxLayout()
         self.wave_view_state = QLabel("横向 1.00×  ·  纵向 1.00×  ·  最新", objectName="muted")
         interaction.addWidget(self.wave_view_state)
         interaction.addStretch()
-        interaction.addWidget(QLabel("滚轮：时间宽度  ·  Ctrl+滚轮：纵向  ·  拖拽：回看  ·  双击：复位", objectName="muted"))
-        self.live_plot.viewport_changed.connect(self.wave_view_state.setText)
+        interaction.addWidget(QLabel("右键：绑定成员  ·  暂停后悬停：查看点值  ·  滚轮：缩放  ·  拖拽：回看", objectName="muted"))
         layout.addLayout(interaction)
         return widget
 
+    def _active_live_plot(self) -> LivePlotWidget:
+        return self.live_plots[self.wave_tabs.currentIndex()]
+
+    def _wave_viewport_changed(self, view: int, text: str) -> None:
+        if self.wave_tabs.currentIndex() == view:
+            self.wave_view_state.setText(text)
+
+    def _wave_tab_changed(self, view: int) -> None:
+        self.wave_view_state.setText(self.live_plots[view]._view_state_text())
+
+    def _populate_wave_binding_menu(self, menu: QMenu, view: int) -> None:
+        """Build a channel chooser directly inside a waveform context menu."""
+        for config in self.parsers:
+            indices = sorted(config["enabled"])
+            if not indices:
+                continue
+            target_menu = menu
+            if config["count"] > 1:
+                target_menu = menu.addMenu(config["name"])
+            for index in indices:
+                label = self._series_name(config, index)
+                if config["count"] > 1:
+                    label = config["members"][index]
+                action = target_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(index in config["plot_views"][view])
+                action.toggled.connect(
+                    lambda checked, cfg=config, member=index, target=view: self._set_wave_binding(
+                        cfg, member, target, checked
+                    )
+                )
+
     def _clear_wave_data(self) -> None:
-        self.live_plot.clear()
+        for plot in self.live_plots:
+            plot.clear()
         self.wave_recorder.clear()
         self._wave_count_dirty = False
         self.wave_record_count.setText("已记录 0 行")
@@ -1062,6 +1107,7 @@ class MainWindow(QMainWindow):
                 "members": list(config["members"]),
                 "enabled": sorted(config["enabled"]),
                 "plots": sorted(config["plots"]),
+                "plot_views": [sorted(view) for view in config["plot_views"]],
             })
         return {
             "schema": PROJECT_SCHEMA,
@@ -1123,6 +1169,8 @@ class MainWindow(QMainWindow):
                 "window_size": {"width": self.width(), "height": self.height()},
                 "splitter_sizes": self.body_splitter.sizes(),
                 "wave_view": self.live_plot.view_state(),
+                "wave_views": [plot.view_state() for plot in self.live_plots],
+                "active_wave_view": self.wave_tabs.currentIndex(),
             },
         }
 
@@ -1233,13 +1281,17 @@ class MainWindow(QMainWindow):
             config["members"] = list(saved["members"])
             config["enabled"] = set(saved["enabled"])
             config["plots"] = set(saved["plots"])
+            config["plot_views"] = [
+                set(view) for view in saved.get("plot_views", [saved["plots"], []])
+            ]
             self._insert_parser(config)
             for index in set(range(config["count"])) - config["enabled"]:
                 item = config["member_items"].pop(index, None)
                 if item is not None and item is not config["item"]:
                     config["item"].removeChild(item)
-            for index in config["plots"]:
-                self._register_parser_member(config, index)
+            for view, members in enumerate(config["plot_views"]):
+                for index in members:
+                    self._register_parser_member(config, index, view)
             self._refresh_parser_binding_text(config)
 
         write = document["write"]
@@ -1272,7 +1324,10 @@ class MainWindow(QMainWindow):
         self.right_tabs.setCurrentIndex(right_tabs[ui["right_tab"]])
         self.resize(ui["window_size"]["width"], ui["window_size"]["height"])
         self.body_splitter.setSizes(ui["splitter_sizes"])
-        self.live_plot.restore_view_state(ui["wave_view"])
+        wave_views = ui.get("wave_views", [ui["wave_view"], ui["wave_view"]])
+        for plot, state in zip(self.live_plots, wave_views):
+            plot.restore_view_state(state)
+        self.wave_tabs.setCurrentIndex(ui.get("active_wave_view", 0))
         self._apply_filters()
         self._update_builder()
         self._update_write_preview()
@@ -1399,8 +1454,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_display_pause(self, paused: bool) -> None:
         self.pause_button.setText("继续" if paused else "暂停")
+        for plot in self.live_plots:
+            plot.set_inspection_enabled(paused)
         if paused:
-            self.status_label.setText("显示已暂停 · 串口接收和安全轮询仍在后台运行")
+            self.status_label.setText("显示已暂停 · 可在波形上悬停查看各通道采样值")
             return
         self.rx_metric.setText(f"{self.rx_bytes:,}")
         self.tx_metric.setText(f"{self.tx_bytes:,}")
@@ -1800,6 +1857,7 @@ class MainWindow(QMainWindow):
             f"成员 {index}" for index in range(config["count"])
         ]
         config["plots"] = set()
+        config["plot_views"] = [set(), set()]
         config["enabled"] = set(range(config["count"]))
         range_message = self._expand_poll_range_for_parser(config)
         self._insert_parser(config)
@@ -1827,6 +1885,14 @@ class MainWindow(QMainWindow):
         return f"；轮询数量已自动扩大为 {required_quantity}{suffix}"
 
     def _insert_parser(self, config: dict) -> None:
+        saved_views = config.get("plot_views")
+        if saved_views is None:
+            config["plot_views"] = [set(config.get("plots", set())), set()]
+        else:
+            config["plot_views"] = [set(view) for view in saved_views[:2]]
+            while len(config["plot_views"]) < 2:
+                config["plot_views"].append(set())
+        config["plots"] = set().union(*config["plot_views"])
         self.parsers.append(config)
         uid = id(config)
         is_single = config["count"] == 1
@@ -1876,20 +1942,36 @@ class MainWindow(QMainWindow):
             return config["name"]
         return f"{config['name']}.{config['members'][index]}"
 
-    def _register_parser_member(self, config: dict, index: int) -> None:
+    def _register_parser_member(self, config: dict, index: int, view: int) -> None:
         color_index = (self.parsers.index(config) + index) % len(self.parser_colors)
         color = self.parser_colors[color_index]
-        self.live_plot.register_series(self._series_name(config, index), color)
+        self.live_plots[view].register_series(self._series_name(config, index), color)
+
+    def _set_wave_binding(self, config: dict, index: int, view: int, enabled: bool) -> None:
+        if enabled:
+            config["plot_views"][view].add(index)
+            self._register_parser_member(config, index, view)
+        else:
+            config["plot_views"][view].discard(index)
+            self.live_plots[view].remove_series(self._series_name(config, index))
+        config["plots"] = set().union(*config["plot_views"])
+        self._refresh_parser_binding_text(config)
+        state = "已绑定到" if enabled else "已移出"
+        self.status_label.setText(f"“{self._series_name(config, index)}”{state}波形 {'AB'[view]}")
+
+    def _member_binding_text(self, config: dict, index: int) -> str:
+        views = "".join("AB"[view] for view in range(2) if index in config["plot_views"][view])
+        return f"● 波形 {views}" if views else "未绑定"
 
     def _refresh_parser_binding_text(self, config: dict) -> None:
         plots = config["plots"]
         if config["count"] == 1:
-            config["item"].setText(3, "● 波形调试" if plots else "未绑定")
+            config["item"].setText(3, self._member_binding_text(config, 0))
             config["item"].setForeground(3, QColor(config["color"]) if plots else QColor())
             return
         config["item"].setText(3, f"{len(plots)} 个已绑定" if plots else "未绑定")
         for index, item in config["member_items"].items():
-            item.setText(3, "● 波形调试" if index in plots else "未绑定")
+            item.setText(3, self._member_binding_text(config, index))
             item.setForeground(3, QColor(config["color"]) if index in plots else QColor())
 
     def _show_parser_context_menu(self, position) -> None:
@@ -1898,17 +1980,19 @@ class MainWindow(QMainWindow):
         if config is None:
             return
         self.parser_tree.setCurrentItem(item)
-        menu = QMenu(self)
+        menu = GlassMenu(self)
         is_structure = member < 0
+        active_view = self.wave_tabs.currentIndex()
+        view_name = "AB"[active_view]
         if is_structure:
-            bind_action = menu.addAction("全部添加到波形调试")
-            unbind_action = menu.addAction("全部移出波形调试")
+            bind_action = menu.addAction(f"全部添加到波形 {view_name}")
+            unbind_action = menu.addAction("全部移出两个波形")
             rename_action = menu.addAction("重命名结构")
         else:
-            bind_action = menu.addAction("添加到波形调试")
-            unbind_action = menu.addAction("移出波形调试")
+            bind_action = menu.addAction(f"添加到波形 {view_name}")
+            unbind_action = menu.addAction("移出两个波形")
             rename_action = menu.addAction("重命名变量" if config["count"] == 1 else "重命名成员")
-            bind_action.setEnabled(member not in config["plots"])
+            bind_action.setEnabled(member not in config["plot_views"][active_view])
             unbind_action.setEnabled(member in config["plots"])
         menu.addSeparator()
         delete_action = menu.addAction("删除结构" if is_structure else ("删除变量" if config["count"] == 1 else "删除此成员"))
@@ -1916,16 +2000,13 @@ class MainWindow(QMainWindow):
         if chosen == bind_action:
             indices = config["enabled"] if member < 0 else {member}
             for index in indices:
-                config["plots"].add(index)
-                self._register_parser_member(config, index)
-            self._refresh_parser_binding_text(config)
-            self.status_label.setText(f"“{config['name']}”已添加到波形调试")
+                self._set_wave_binding(config, index, active_view, True)
+            self.status_label.setText(f"“{config['name']}”已添加到波形 {view_name}")
         elif chosen == unbind_action:
             indices = set(config["plots"]) if member < 0 else {member}
             for index in indices:
-                config["plots"].discard(index)
-                self.live_plot.remove_series(self._series_name(config, index))
-            self._refresh_parser_binding_text(config)
+                for view in range(2):
+                    self._set_wave_binding(config, index, view, False)
             self.status_label.setText(f"已更新“{config['name']}”的波形绑定")
         elif chosen == rename_action:
             self._rename_parser_item(config, member)
@@ -1942,7 +2023,8 @@ class MainWindow(QMainWindow):
         """Remove every parser and waveform binding in one operation."""
         self.parsers.clear()
         self.parser_tree.clear()
-        self.live_plot.clear_all_series()
+        for plot in self.live_plots:
+            plot.clear_all_series()
         self.wave_recorder.clear()
         self._wave_count_dirty = False
         self.wave_record_count.setText("已记录 0 行")
@@ -1952,12 +2034,15 @@ class MainWindow(QMainWindow):
         if member < 0 or config["count"] == 1:
             self.parsers.remove(config)
             self.parser_tree.takeTopLevelItem(self.parser_tree.indexOfTopLevelItem(config["item"]))
-            self.live_plot.remove_series(config["name"])
+            for plot in self.live_plots:
+                plot.remove_series(config["name"])
             self.status_label.setText(f"已删除解析结构“{config['name']}”")
             return
         config["enabled"].discard(member)
         config["plots"].discard(member)
-        self.live_plot.remove_series(self._series_name(config, member))
+        for view, plot in enumerate(self.live_plots):
+            config["plot_views"][view].discard(member)
+            plot.remove_series(self._series_name(config, member))
         item = config["member_items"].pop(member)
         config["item"].removeChild(item)
         self._refresh_parser_binding_text(config)
@@ -1985,7 +2070,8 @@ class MainWindow(QMainWindow):
             config["members"][member] = new_name
             config["member_items"][member].setText(0, new_name)
         for index, previous_name in old_series.items():
-            self.live_plot.rename_series(previous_name, self._series_name(config, index))
+            for plot in self.live_plots:
+                plot.rename_series(previous_name, self._series_name(config, index))
         self.status_label.setText(f"已重命名为“{new_name}”")
 
     def _parse_frame_channels(self, frame: RtuFrame) -> None:
@@ -2034,7 +2120,11 @@ class MainWindow(QMainWindow):
                 if index in config["plots"]:
                     series_name = self._series_name(config, index)
                     color_index = (self.parsers.index(config) + index) % len(self.parser_colors)
-                    self.live_plot.add_sample(series_name, float(value), self.parser_colors[color_index])
+                    for view, members in enumerate(config["plot_views"]):
+                        if index in members:
+                            self.live_plots[view].add_sample(
+                                series_name, float(value), self.parser_colors[color_index]
+                            )
                     waveform_values[series_name] = value
         if waveform_values:
             self.wave_recorder.append(frame.timestamp, waveform_values)
@@ -2143,7 +2233,8 @@ class MainWindow(QMainWindow):
         self.raw_text.clear()
         self.detail_text.clear()
         self.byte_overview.clear()
-        self.live_plot.clear()
+        for plot in self.live_plots:
+            plot.clear()
         self.wave_recorder.clear()
         self._wave_count_dirty = False
         self.wave_record_count.setText("已记录 0 行")

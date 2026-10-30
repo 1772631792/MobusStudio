@@ -15,7 +15,7 @@ class HorizontalTextSideTabBar(QTabBar):
     """East-side vertical tab stack whose labels remain horizontal."""
 
     def tabSizeHint(self, index: int) -> QSize:  # noqa: N802
-        return QSize(82, 46)
+        return QSize(90, 50)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QStylePainter(self)
@@ -32,10 +32,27 @@ class HorizontalTextSideTabBar(QTabBar):
             painter.drawText(self.tabRect(index), Qt.AlignmentFlag.AlignCenter, text)
 
 
+class GlassMenu(QMenu):
+    """Rounded, slightly translucent menu whose submenus keep the same treatment."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowOpacity(0.96)
+
+    def addMenu(self, menu_or_title):  # noqa: N802
+        if isinstance(menu_or_title, str):
+            submenu = GlassMenu(menu_or_title, self)
+            super().addMenu(submenu)
+            return submenu
+        return super().addMenu(menu_or_title)
+
+
 class LivePlotWidget(QWidget):
     """Dependency-free oscilloscope plot with zooming, panning and channel visibility."""
 
     viewport_changed = Signal(str)
+    binding_menu_requested = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -53,6 +70,7 @@ class LivePlotWidget(QWidget):
         self._drag_origin: QPoint | None = None
         self._drag_offset = 0
         self._cursor_pos: QPoint | None = None
+        self._inspection_enabled = False
         self._legend_rows: list[tuple[QRectF, str]] = []
         # Store every sample, but cap visual repaint requests. At high polling rates
         # this keeps the UI responsive without reducing CSV/waveform data fidelity.
@@ -141,6 +159,11 @@ class LivePlotWidget(QWidget):
         self._hidden.clear()
         self.update()
 
+    def set_inspection_enabled(self, enabled: bool) -> None:
+        """Enable stable point inspection while acquisition display is paused."""
+        self._inspection_enabled = bool(enabled)
+        self.update()
+
     def _window_size(self) -> int:
         return max(20, int(self._base_window / self._x_zoom))
 
@@ -152,8 +175,11 @@ class LivePlotWidget(QWidget):
         self._history_offset = max(0, min(self._history_offset, maximum))
 
     def _emit_view_state(self) -> None:
+        self.viewport_changed.emit(self._view_state_text())
+
+    def _view_state_text(self) -> str:
         mode = "最新" if self._history_offset == 0 else f"回看 {self._history_offset} 点"
-        self.viewport_changed.emit(f"横向 {self._x_zoom:.2f}×  ·  纵向 {self._y_zoom:.2f}×  ·  {mode}")
+        return f"横向 {self._x_zoom:.2f}×  ·  纵向 {self._y_zoom:.2f}×  ·  {mode}"
 
     def _plot_rect(self) -> QRectF:
         return QRectF(64, 18, max(20, self.width() - 82), max(20, self.height() - 58))
@@ -229,7 +255,13 @@ class LivePlotWidget(QWidget):
             self.reset_view()
 
     def _show_context_menu(self, global_pos: QPoint) -> None:
-        menu = QMenu(self)
+        menu = GlassMenu(self)
+        binding_menu = menu.addMenu("绑定解析成员")
+        self.binding_menu_requested.emit(binding_menu)
+        if binding_menu.isEmpty():
+            unavailable = binding_menu.addAction("暂无可绑定成员")
+            unavailable.setEnabled(False)
+        menu.addSeparator()
         reset = menu.addAction("自动适应 / 复位视图")
         latest = menu.addAction("回到最新数据")
         show_all = menu.addAction("显示全部通道")
@@ -328,3 +360,47 @@ class LivePlotWidget(QWidget):
             painter.setPen(cursor_pen)
             painter.drawLine(QPointF(self._cursor_pos.x(), plot.top()), QPointF(self._cursor_pos.x(), plot.bottom()))
             painter.drawLine(QPointF(plot.left(), self._cursor_pos.y()), QPointF(plot.right(), self._cursor_pos.y()))
+            if self._inspection_enabled and visible_data:
+                ratio = max(0.0, min(1.0, (self._cursor_pos.x() - plot.left()) / max(1.0, plot.width())))
+                longest = max((len(samples) for samples in visible_data.values()), default=0)
+                sample_index = min(max(0, round(ratio * max(0, longest - 1))), max(0, longest - 1))
+                rows: list[tuple[str, float, QColor]] = []
+                for name, samples in visible_data.items():
+                    if not samples:
+                        continue
+                    index = min(sample_index, len(samples) - 1)
+                    value = samples[index]
+                    rows.append((name, value, self._colors.get(name, QColor("#08b9a1"))))
+                    if values:
+                        x = plot.left() + plot.width() * index / max(1, len(samples) - 1)
+                        y = plot.bottom() - (value - low) / max(1e-15, high - low) * plot.height()
+                        painter.setPen(QPen(bg, 1))
+                        painter.setBrush(self._colors.get(name, QColor("#08b9a1")))
+                        painter.drawEllipse(QPointF(x, y), 4.5, 4.5)
+                if rows:
+                    panel_width = min(270.0, max(170.0, max(len(name) for name, _value, _color in rows) * 8.0 + 105.0))
+                    panel_height = 28.0 + min(12, len(rows)) * 22.0
+                    panel_x = self._cursor_pos.x() + 14.0
+                    if panel_x + panel_width > plot.right():
+                        panel_x = self._cursor_pos.x() - panel_width - 14.0
+                    panel_y = max(plot.top() + 6.0, min(self._cursor_pos.y() + 12.0, plot.bottom() - panel_height - 6.0))
+                    panel = QRectF(panel_x, panel_y, panel_width, panel_height)
+                    painter.setPen(QPen(grid, 1))
+                    painter.setBrush(QColor(15, 24, 36, 238) if dark else QColor(255, 255, 255, 245))
+                    painter.drawRoundedRect(panel, 6, 6)
+                    painter.setFont(QFont("Microsoft YaHei UI", 9))
+                    painter.setPen(text)
+                    painter.drawText(QRectF(panel.left() + 10, panel.top() + 4, panel.width() - 20, 20), f"样本 #{sample_index + 1}")
+                    for row_index, (name, value, color) in enumerate(rows[:12]):
+                        y = panel.top() + 28 + row_index * 22
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(color)
+                        painter.drawEllipse(QRectF(panel.left() + 10, y + 5, 8, 8))
+                        painter.setPen(text)
+                        label = name if len(name) <= 22 else name[:21] + "…"
+                        painter.drawText(QRectF(panel.left() + 25, y, panel.width() - 96, 19), label)
+                        painter.drawText(
+                            QRectF(panel.right() - 88, y, 78, 19),
+                            Qt.AlignmentFlag.AlignRight,
+                            f"{value:.8g}",
+                        )
