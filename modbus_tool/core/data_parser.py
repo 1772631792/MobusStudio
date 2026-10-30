@@ -63,6 +63,38 @@ def parse_typed_values(
     return values
 
 
+def encode_typed_values(
+    values: list[float | int],
+    data_type: str,
+    byte_order: str = "big",
+) -> bytes:
+    """Encode typed values using the same byte-order rules as the parser."""
+    if not values:
+        raise ValueError("至少需要一个写入值")
+    if byte_order not in ("big", "little", "word_swap", "byte_swap"):
+        raise ValueError("不支持的字节顺序")
+    code = TYPE_FORMATS.get(data_type)
+    if code is None:
+        raise ValueError(f"不支持的数据类型：{data_type}")
+    size = struct.calcsize(code)
+    encoded = bytearray()
+    for value in values:
+        try:
+            if byte_order == "little":
+                chunk = struct.pack(f"<{code}", value)
+            else:
+                chunk = struct.pack(f">{code}", value)
+                if byte_order == "word_swap" and size >= 4:
+                    words = [chunk[pos : pos + 2] for pos in range(0, size, 2)]
+                    chunk = b"".join(reversed(words))
+                elif byte_order == "byte_swap" and size >= 2:
+                    chunk = b"".join(chunk[pos : pos + 2][::-1] for pos in range(0, size, 2))
+        except (struct.error, OverflowError) as exc:
+            raise ValueError(f"数值 {value} 超出 {data_type} 的范围") from exc
+        encoded.extend(chunk)
+    return bytes(encoded)
+
+
 def modbus_data_area(frame: bytes) -> bytes:
     """Return the business-data area from a common Modbus RTU response."""
     if len(frame) < 4:

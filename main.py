@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
 from modbus_tool.ui.main_window import MainWindow
 from modbus_tool.ui.styles import LIGHT_STYLE
+
+
+def resource_path(relative: str) -> Path:
+    """Resolve a resource both from source and from a PyInstaller one-file bundle."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / relative
 
 
 def main() -> int:
@@ -19,7 +26,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Modbus Studio")
     app.setOrganizationName("ModbusStudio")
-    app.setFont(QFont("Microsoft YaHei UI", 10))
+    icon_path = resource_path("resources/modbus_studio.png")
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
+    app.setFont(QFont("Microsoft YaHei UI", 12))
     app.setStyle("Fusion")
     app.setStyleSheet(LIGHT_STYLE)
 

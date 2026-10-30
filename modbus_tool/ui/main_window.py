@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
+import json
+import math
+from pathlib import Path
 import time
 
 import serial
@@ -16,23 +20,27 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QFrame,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
     QTableView,
-    QTableWidget,
-    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -45,9 +53,11 @@ from modbus_tool.core.modbus import (
     hex_text,
     parse_hex,
 )
-from modbus_tool.core.data_parser import modbus_data_area, parse_typed_values
+from modbus_tool.core.data_parser import encode_typed_values, modbus_data_area, parse_typed_values, type_size
+from modbus_tool.core.project_config import PROJECT_SCHEMA, PROJECT_VERSION, validate_project
 from modbus_tool.core.serial_worker import SerialWorker
 from modbus_tool.core.settings import Settings
+from modbus_tool.core.wave_recorder import CsvExportWorker, WaveRecorder
 from modbus_tool.ui.styles import DARK_STYLE, LIGHT_STYLE
 from modbus_tool.ui.widgets import HorizontalTextSideTabBar, LivePlotWidget
 
@@ -96,14 +106,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = Settings()
         self.worker: SerialWorker | None = None
-        self.frames: list[RtuFrame] = []
+        self.frames: deque[RtuFrame] = deque()
         self.rx_bytes = 0
         self.tx_bytes = 0
         self.good_frames = 0
         self.bad_frames = 0
         self._last_preview = b""
+        self._last_write_frame = b""
         self._known_ports: tuple[tuple[str, str, str], ...] = ()
         self.parsers: list[dict] = []
+        self._parser_sequence = 0
         self.parser_colors = ["#00bfa5", "#0879be", "#ef476f", "#f2a541", "#8b5cf6", "#35a853"]
         self.poll_active = False
         self.poll_waiting = False
@@ -111,6 +123,12 @@ class MainWindow(QMainWindow):
         self.poll_failures = 0
         self.poll_sent_at = 0.0
         self.poll_request = b""
+        self.poll_sent_quantity = 0
+        self.wave_recorder = WaveRecorder(max_rows=200_000)
+        self.export_worker: CsvExportWorker | None = None
+        self._raw_pending: deque[str] = deque(maxlen=5000)
+        self._overview_dirty = False
+        self._wave_count_dirty = False
 
         self.setWindowTitle("Modbus Studio · RTU")
         self.resize(1360, 840)
@@ -119,6 +137,14 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         self.refresh_ports(manual=True)
         self._update_builder()
+        self.raw_flush_timer = QTimer(self)
+        self.raw_flush_timer.setInterval(50)
+        self.raw_flush_timer.timeout.connect(self._flush_raw_output)
+        self.raw_flush_timer.start()
+        self.overview_refresh_timer = QTimer(self)
+        self.overview_refresh_timer.setInterval(250)
+        self.overview_refresh_timer.timeout.connect(self._flush_overview)
+        self.overview_refresh_timer.start()
         self.port_scan_timer = QTimer(self)
         self.port_scan_timer.setInterval(1000)
         self.port_scan_timer.timeout.connect(self.refresh_ports)
@@ -131,20 +157,45 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(9)
         root_layout.addWidget(self._build_top_bar())
 
-        body = QSplitter(Qt.Orientation.Horizontal)
-        body.setChildrenCollapsible(False)
-        body.addWidget(self._build_workspace())
-        body.addWidget(self._build_right_tabs())
-        body.setStretchFactor(0, 1)
-        body.setSizes([980, 350])
-        root_layout.addWidget(body, 1)
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.body_splitter.setChildrenCollapsible(False)
+        self.body_splitter.addWidget(self._build_workspace())
+        self.body_splitter.addWidget(self._build_right_tabs())
+        self.body_splitter.setStretchFactor(0, 1)
+        self.body_splitter.setSizes([820, 520])
+        root_layout.addWidget(self.body_splitter, 1)
         self.setCentralWidget(root)
 
         status = QStatusBar()
         status.setSizeGripEnabled(False)
         self.status_label = QLabel("就绪 · 等待连接串口")
-        status.addWidget(self.status_label)
-        status.addPermanentWidget(QLabel("RTU  |  v0.1.0"))
+        status.addWidget(self.status_label, 1)
+        recent = QWidget()
+        recent_layout = QHBoxLayout(recent)
+        recent_layout.setContentsMargins(8, 0, 8, 0)
+        recent_layout.setSpacing(5)
+        recent_layout.addWidget(QLabel("最近帧  站号"))
+        self.recent_address = QLabel("---")
+        self.recent_address.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recent_address.setFixedWidth(42)
+        recent_layout.addWidget(self.recent_address)
+        recent_layout.addWidget(QLabel("·"))
+        self.recent_function = QLabel("等待数据")
+        self.recent_function.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recent_function.setFixedWidth(132)
+        recent_layout.addWidget(self.recent_function)
+        recent_layout.addWidget(QLabel("·"))
+        self.recent_bytes = QLabel("0")
+        self.recent_bytes.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.recent_bytes.setFixedWidth(52)
+        recent_layout.addWidget(self.recent_bytes)
+        recent_layout.addWidget(QLabel("bytes  ·  CRC"))
+        self.recent_crc = QLabel("---")
+        self.recent_crc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recent_crc.setFixedWidth(48)
+        recent_layout.addWidget(self.recent_crc)
+        status.addPermanentWidget(recent)
+        status.addPermanentWidget(QLabel("RTU  |  v0.2.0"))
         self.setStatusBar(status)
 
     def _build_top_bar(self) -> QWidget:
@@ -212,7 +263,7 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.auto_scroll)
         pause = QPushButton("暂停")
         pause.setCheckable(True)
-        pause.toggled.connect(lambda checked: pause.setText("继续" if checked else "暂停"))
+        pause.toggled.connect(self._toggle_display_pause)
         self.pause_button = pause
         tools.addWidget(pause)
         clear = QPushButton("清空", objectName="danger")
@@ -320,38 +371,106 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.addWidget(QLabel("实时数据波形", objectName="sectionTitle"))
-        title_box.addWidget(QLabel("在右侧“解析”选项卡中勾选绑定波形", objectName="muted"))
+        title_box.addWidget(QLabel("进入本页会打开“解析”，右键通道即可绑定波形", objectName="muted"))
         header.addLayout(title_box)
         header.addStretch()
-        clear_plot = QPushButton("清空波形")
-        clear_plot.clicked.connect(lambda: self.live_plot.clear())
-        header.addWidget(clear_plot)
-        layout.addLayout(header)
+        self.wave_record_count = QLabel("已记录 0 行", objectName="muted")
+        header.addWidget(self.wave_record_count)
         self.live_plot = LivePlotWidget()
+        reset_plot = QPushButton("适应视图")
+        reset_plot.setToolTip("恢复自动量程并回到最新数据；也可在绘图区双击")
+        reset_plot.clicked.connect(self.live_plot.reset_view)
+        self.export_csv_button = QPushButton("导出 CSV")
+        self.export_csv_button.clicked.connect(self._export_wave_csv)
+        header.addWidget(self.export_csv_button)
+        clear_plot = QPushButton("清空波形")
+        clear_plot.clicked.connect(self._clear_wave_data)
+        header.addWidget(clear_plot)
+        header.insertWidget(header.count() - 2, reset_plot)
+        layout.addLayout(header)
         layout.addWidget(self.live_plot, 1)
+        interaction = QHBoxLayout()
+        self.wave_view_state = QLabel("横向 1.00×  ·  纵向 1.00×  ·  最新", objectName="muted")
+        interaction.addWidget(self.wave_view_state)
+        interaction.addStretch()
+        interaction.addWidget(QLabel("滚轮：时间宽度  ·  Ctrl+滚轮：纵向  ·  拖拽：回看  ·  双击：复位", objectName="muted"))
+        self.live_plot.viewport_changed.connect(self.wave_view_state.setText)
+        layout.addLayout(interaction)
         return widget
+
+    def _clear_wave_data(self) -> None:
+        self.live_plot.clear()
+        self.wave_recorder.clear()
+        self._wave_count_dirty = False
+        self.wave_record_count.setText("已记录 0 行")
+        self.status_label.setText("波形数据已清空，通道绑定保持不变")
+
+    def _export_wave_csv(self) -> None:
+        if len(self.wave_recorder) == 0:
+            QMessageBox.information(self, "没有波形数据", "请先绑定解析通道并接收数据。")
+            return
+        default_name = datetime.now().strftime("modbus_wave_%Y%m%d_%H%M%S.csv")
+        target, _selected_filter = QFileDialog.getSaveFileName(
+            self, "导出波形 CSV", default_name, "CSV 文件 (*.csv)"
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+        self.export_csv_button.setEnabled(False)
+        self.export_csv_button.setText("正在导出…")
+        self.export_worker = CsvExportWorker(target, self.wave_recorder, self)
+        self.export_worker.export_finished.connect(self._csv_export_finished)
+        self.export_worker.export_failed.connect(self._csv_export_failed)
+        self.export_worker.start()
+
+    def _csv_export_finished(self, path: str, row_count: int) -> None:
+        self.export_csv_button.setEnabled(True)
+        self.export_csv_button.setText("导出 CSV")
+        self.status_label.setText(f"已导出 {row_count:,} 行波形数据：{path}")
+        if self.export_worker:
+            self.export_worker.deleteLater()
+            self.export_worker = None
+
+    def _csv_export_failed(self, message: str) -> None:
+        self.export_csv_button.setEnabled(True)
+        self.export_csv_button.setText("导出 CSV")
+        QMessageBox.warning(self, "CSV 导出失败", message)
+        if self.export_worker:
+            self.export_worker.deleteLater()
+            self.export_worker = None
 
     def _build_right_tabs(self) -> QWidget:
         self.right_tabs = QTabWidget()
         # The tab stack is vertical on the right, but labels are custom-painted horizontally.
         self.right_tabs.setTabBar(HorizontalTextSideTabBar())
         self.right_tabs.setTabPosition(QTabWidget.TabPosition.East)
-        self.right_tabs.setMinimumWidth(400)
-        self.right_tabs.setMaximumWidth(500)
-        self.right_tabs.addTab(self._build_receive_tab(), "接收")
+        self.right_tabs.setMinimumWidth(500)
+        self.right_tabs.setMaximumWidth(650)
+        self.receive_page = self._build_receive_tab()
+        self.right_tabs.addTab(self.receive_page, "接收")
         self.right_tabs.addTab(self._build_poll_tab(), "轮询")
-        self.right_tabs.addTab(self._build_parse_tab(), "解析")
+        self.parse_page = self._build_parse_tab()
+        self.right_tabs.addTab(self.parse_page, "解析")
+        self.write_page = self._build_write_tab()
+        self.right_tabs.addTab(self.write_page, "写入")
         self.right_tabs.addTab(self._build_send_tab(), "构帧")
         self.right_tabs.addTab(self._build_serial_tab(), "串口")
         self.right_tabs.addTab(self._build_settings_tab(), "设置")
         return self.right_tabs
 
     def _tab_page(self) -> tuple[QWidget, QVBoxLayout]:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         page = QWidget()
+        page.setMinimumWidth(300)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        return page, layout
+        scroll.setWidget(page)
+        return scroll, layout
 
     def _build_receive_tab(self) -> QWidget:
         page, layout = self._tab_page()
@@ -438,7 +557,7 @@ class MainWindow(QMainWindow):
         form.addRow("响应超时", self.poll_timeout)
         layout.addLayout(form)
 
-        poll_hint = QLabel("解析通道的“字节偏移”从响应数据区第一个字节开始计算。寄存器每个占 2 字节。")
+        poll_hint = QLabel("解析通道直接填写绝对寄存器地址；软件会根据本轮询起点自动定位数据。")
         poll_hint.setWordWrap(True)
         poll_hint.setObjectName("muted")
         layout.addWidget(poll_hint)
@@ -464,7 +583,12 @@ class MainWindow(QMainWindow):
         page, layout = self._tab_page()
         layout.addWidget(QLabel("数据解析通道", objectName="sectionTitle"))
         layout.addWidget(QLabel("从接收帧中直接提取数值，并可绑定实时波形", objectName="muted"))
+        bind_hint = QLabel("解析一个时通道就是变量；解析多个时可展开成员，双击即可改名")
+        bind_hint.setWordWrap(True)
+        bind_hint.setStyleSheet("color:#0879be")
+        layout.addWidget(bind_hint)
         form = QFormLayout()
+        self.parser_form = form
         self.parser_name = QLineEdit()
         self.parser_name.setPlaceholderText("例：温度")
         self.parser_type = QComboBox()
@@ -488,7 +612,13 @@ class MainWindow(QMainWindow):
             self.parser_function.addItem(text, code)
         self.parser_offset = QSpinBox()
         self.parser_offset.setRange(0, 65535)
-        self.parser_offset.setSuffix(" byte")
+        self.parser_offset.setValue(self.poll_start.value())
+        self.parser_offset.setToolTip("填写设备手册中的绝对寄存器地址，例如1103；float32下一项通常为1105")
+        self.parser_offset_label = QLabel("起始寄存器")
+        self.parser_byte_lane = QComboBox()
+        self.parser_byte_lane.addItem("高字节", 0)
+        self.parser_byte_lane.addItem("低字节", 1)
+        self.parser_byte_lane.setEnabled(False)
         self.parser_count = QSpinBox()
         self.parser_count.setRange(1, 128)
         self.parser_scale = QLineEdit("1.0")
@@ -499,31 +629,241 @@ class MainWindow(QMainWindow):
         form.addRow("数据来源", self.parser_source)
         form.addRow("从站过滤", self.parser_address)
         form.addRow("功能过滤", self.parser_function)
-        form.addRow("字节偏移", self.parser_offset)
+        form.addRow(self.parser_offset_label, self.parser_offset)
+        form.addRow("8位字节位置", self.parser_byte_lane)
         form.addRow("解析数量", self.parser_count)
         form.addRow("缩放倍率", self.parser_scale)
         layout.addLayout(form)
-        self.parser_bind_plot = QCheckBox("绑定到实时波形")
-        self.parser_bind_plot.setChecked(True)
-        layout.addWidget(self.parser_bind_plot)
-        add_parser = QPushButton("添加解析通道", objectName="primary")
+        self.parser_offset_hint = QLabel()
+        self.parser_offset_hint.setWordWrap(True)
+        self.parser_offset_hint.setStyleSheet("background:#e7f4f8;color:#187195;padding:8px;border-radius:6px")
+        layout.addWidget(self.parser_offset_hint)
+        self.parser_type.currentTextChanged.connect(self._update_parser_offset_hint)
+        self.parser_source.currentIndexChanged.connect(self._update_parser_offset_hint)
+        self.parser_offset.valueChanged.connect(self._update_parser_offset_hint)
+        self.parser_count.valueChanged.connect(self._update_parser_offset_hint)
+        self.parser_byte_lane.currentIndexChanged.connect(self._update_parser_offset_hint)
+        self._last_poll_start = self.poll_start.value()
+        self.poll_start.valueChanged.connect(self._sync_parser_register_with_poll)
+        self._update_parser_offset_hint()
+        add_parser = QPushButton("添加解析结构", objectName="primary")
         add_parser.clicked.connect(self._add_parser)
         layout.addWidget(add_parser)
 
-        self.parser_table = QTableWidget(0, 4)
-        self.parser_table.setHorizontalHeaderLabels(["通道", "类型", "当前值", "波形"])
-        self.parser_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.parser_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.parser_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.parser_table.verticalHeader().hide()
-        self.parser_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.parser_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.parser_table.setMinimumHeight(150)
-        layout.addWidget(self.parser_table, 1)
-        remove_parser = QPushButton("删除所选通道", objectName="danger")
+        self.parser_tree = QTreeWidget()
+        self.parser_tree.setColumnCount(4)
+        self.parser_tree.setHeaderLabels(["变量 / 结构", "地址 · 类型", "当前值", "波形"])
+        self.parser_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.parser_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.parser_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.parser_tree.customContextMenuRequested.connect(self._show_parser_context_menu)
+        self.parser_tree.itemDoubleClicked.connect(self._rename_parser_from_double_click)
+        self.parser_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.parser_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.parser_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.parser_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.parser_tree.header().resizeSection(1, 110)
+        self.parser_tree.header().resizeSection(2, 85)
+        self.parser_tree.header().resizeSection(3, 85)
+        self.parser_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.parser_tree.setMinimumHeight(220)
+        self.parser_tree.setAlternatingRowColors(True)
+        self.parser_tree.setStyleSheet("QTreeWidget { font-size: 16px; } QTreeWidget::item { min-height: 32px; }")
+        layout.addWidget(self.parser_tree, 1)
+        remove_parser = QPushButton("删除所选变量 / 结构 / 成员", objectName="danger")
         remove_parser.clicked.connect(self._remove_parser)
-        layout.addWidget(remove_parser)
+        parser_actions = QHBoxLayout()
+        parser_actions.addWidget(remove_parser, 1)
+        clear_parsers = QPushButton("清空所有通道", objectName="danger")
+        clear_parsers.setToolTip("删除全部解析变量、结构和波形绑定")
+        clear_parsers.clicked.connect(self._clear_all_parsers)
+        parser_actions.addWidget(clear_parsers)
+        layout.addLayout(parser_actions)
         return page
+
+    def _build_write_tab(self) -> QWidget:
+        page, layout = self._tab_page()
+        layout.addWidget(QLabel("类型化数据写入", objectName="sectionTitle"))
+        note = QLabel("直接填写数值，软件自动编码数据、选择写功能码并补齐CRC")
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.write_form = form
+        self.write_address = QSpinBox()
+        self.write_address.setRange(1, 247)
+        self.write_address.setValue(1)
+        self.write_target = QComboBox()
+        self.write_target.addItem("保持寄存器", "register")
+        self.write_target.addItem("线圈", "coil")
+        self.write_start = QSpinBox()
+        self.write_start.setRange(0, 65535)
+        self.write_start_label = QLabel("起始寄存器")
+        self.write_type = QComboBox()
+        self.write_type.addItems(["uint16", "int16", "uint32", "int32", "float32", "float64"])
+        self.write_order = QComboBox()
+        self.write_order.addItem("大端 / ABCD", "big")
+        self.write_order.addItem("小端 / DCBA", "little")
+        self.write_order.addItem("字交换 / CDAB", "word_swap")
+        self.write_order.addItem("字节交换 / BADC", "byte_swap")
+        self.write_values = QPlainTextEdit()
+        self.write_values.setMaximumHeight(86)
+        self.write_values.setPlaceholderText("例：12.5, -3.2, 100（支持逗号、空格或换行）")
+        form.addRow("从站地址", self.write_address)
+        form.addRow("写入目标", self.write_target)
+        form.addRow(self.write_start_label, self.write_start)
+        form.addRow("数据类型", self.write_type)
+        form.addRow("字节序", self.write_order)
+        form.addRow("写入数据", self.write_values)
+        layout.addLayout(form)
+
+        preview_card = QFrame(objectName="composerCard")
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.addWidget(QLabel("自动编码预览", objectName="muted"))
+        self.write_function_label = QLabel("等待数据")
+        self.write_function_label.setStyleSheet("color:#0879be;font-weight:700")
+        preview_layout.addWidget(self.write_function_label)
+        self.write_register_preview = QLabel("寄存器：—")
+        self.write_register_preview.setWordWrap(True)
+        self.write_register_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        preview_layout.addWidget(self.write_register_preview)
+        self.write_frame_preview = QPlainTextEdit()
+        self.write_frame_preview.setReadOnly(True)
+        self.write_frame_preview.setMaximumHeight(82)
+        self.write_frame_preview.setFont(QFont("Cascadia Mono", 10))
+        preview_layout.addWidget(self.write_frame_preview)
+        self.write_hint = QLabel("请输入写入数据")
+        self.write_hint.setWordWrap(True)
+        preview_layout.addWidget(self.write_hint)
+        layout.addWidget(preview_card)
+
+        self.write_confirm = QCheckBox("发送前再次确认")
+        self.write_confirm.setChecked(True)
+        layout.addWidget(self.write_confirm)
+        layout.addStretch()
+        self.write_button = QPushButton("发送写入命令", objectName="primary")
+        self.write_button.clicked.connect(self._send_typed_write)
+        self.write_button.setEnabled(False)
+        layout.addWidget(self.write_button)
+
+        self.write_target.currentIndexChanged.connect(self._write_target_changed)
+        self.write_address.valueChanged.connect(self._update_write_preview)
+        self.write_start.valueChanged.connect(self._update_write_preview)
+        self.write_type.currentTextChanged.connect(self._update_write_preview)
+        self.write_order.currentIndexChanged.connect(self._update_write_preview)
+        self.write_values.textChanged.connect(self._update_write_preview)
+        self._write_target_changed()
+        return page
+
+    @staticmethod
+    def _split_write_tokens(text: str) -> list[str]:
+        normalized = text.replace("，", ",").replace("；", ",").replace(";", ",")
+        return [token for token in normalized.replace("\n", ",").replace("\t", ",").replace(" ", ",").split(",") if token]
+
+    def _write_target_changed(self, *_args) -> None:
+        register_mode = self.write_target.currentData() == "register"
+        self.write_start_label.setText("起始寄存器" if register_mode else "起始线圈")
+        self.write_form.setRowVisible(self.write_type, register_mode)
+        self.write_form.setRowVisible(self.write_order, register_mode)
+        self.write_values.setPlaceholderText(
+            "例：12.5, -3.2, 100（支持逗号、空格或换行）"
+            if register_mode else
+            "例：1, 0, true, false, on, off"
+        )
+        self._update_write_preview()
+
+    def _parse_coil_values(self, tokens: list[str]) -> list[int]:
+        mapping = {"1": 1, "true": 1, "on": 1, "yes": 1, "开": 1,
+                   "0": 0, "false": 0, "off": 0, "no": 0, "关": 0}
+        values = []
+        for token in tokens:
+            key = token.strip().lower()
+            if key not in mapping:
+                raise ValueError(f"无法识别线圈值“{token}”，请使用0/1或true/false")
+            values.append(mapping[key])
+        return values
+
+    def _update_write_preview(self, *_args) -> None:
+        self._last_write_frame = b""
+        tokens = self._split_write_tokens(self.write_values.toPlainText())
+        if not tokens:
+            self.write_function_label.setText("等待数据")
+            self.write_register_preview.setText("寄存器：—")
+            self.write_frame_preview.clear()
+            self.write_hint.setText("请输入写入数据")
+            self.write_button.setEnabled(False)
+            return
+        try:
+            if self.write_target.currentData() == "coil":
+                values = self._parse_coil_values(tokens)
+                function = 5 if len(values) == 1 else 15
+                frame = build_request(
+                    self.write_address.value(), function, self.write_start.value(), values=values
+                )
+                self.write_register_preview.setText("线圈：" + ", ".join(map(str, values)))
+                detail = f"{len(values)} 个线圈"
+            else:
+                data_type = self.write_type.currentText()
+                integer_type = data_type.startswith(("uint", "int"))
+                values = [int(token, 0) if integer_type else float(token) for token in tokens]
+                if not integer_type and any(not math.isfinite(value) for value in values):
+                    raise ValueError("浮点写入值不能是 NaN 或 Infinity")
+                encoded = encode_typed_values(values, data_type, self.write_order.currentData())
+                if len(encoded) % 2:
+                    encoded += b"\x00"
+                registers = [int.from_bytes(encoded[pos : pos + 2], "big") for pos in range(0, len(encoded), 2)]
+                function = 6 if len(registers) == 1 else 16
+                frame = build_request(
+                    self.write_address.value(), function, self.write_start.value(), values=registers
+                )
+                register_text = ", ".join(f"0x{value:04X}" for value in registers)
+                self.write_register_preview.setText(f"寄存器：{register_text}")
+                detail = f"{len(values)} 个 {data_type} → {len(registers)} 个寄存器"
+            function_name = FUNCTION_NAMES[function]
+            self.write_function_label.setText(f"自动选择 0x{function:02X} · {function_name}")
+            self.write_frame_preview.setPlainText(hex_text(frame))
+            self.write_hint.setText(f"{detail} · 完整帧 {len(frame)} bytes")
+            self.write_hint.setStyleSheet("color:#209567")
+            self._last_write_frame = frame
+            self.write_button.setEnabled(True)
+        except (ValueError, OverflowError) as exc:
+            self.write_function_label.setText("数据无效")
+            self.write_register_preview.setText("寄存器：—")
+            self.write_frame_preview.clear()
+            self.write_hint.setText(str(exc))
+            self.write_hint.setStyleSheet("color:#df5262")
+            self.write_button.setEnabled(False)
+
+    def _send_typed_write(self) -> None:
+        if not self._last_write_frame:
+            return
+        if self.poll_active:
+            self.status_label.setText("安全轮询运行中，请先停止轮询再执行写入")
+            return
+        if not self.worker or not self.worker.isRunning():
+            QMessageBox.information(self, "尚未连接", "请先连接串口，再发送写入命令。")
+            return
+        if self.write_confirm.isChecked():
+            answer = QMessageBox.question(
+                self,
+                "确认写入设备",
+                f"即将写入从站 {self.write_address.value()}，起始地址 {self.write_start.value()}。\n"
+                "写入会修改设备数据，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            self.worker.send(self._last_write_frame)
+        except serial.SerialException as exc:
+            self._on_serial_error(str(exc))
+            return
+        self.tx_bytes += len(self._last_write_frame)
+        self.tx_metric.setText(f"{self.tx_bytes:,}")
+        self._on_frame(self._last_write_frame, "TX")
+        self.status_label.setText("写入命令已发送，等待从站响应")
 
     def _build_send_tab(self) -> QWidget:
         page, layout = self._tab_page()
@@ -670,13 +1010,282 @@ class MainWindow(QMainWindow):
         description.setWordWrap(True)
         description.setObjectName("muted")
         layout.addWidget(description)
+        layout.addSpacing(18)
+        layout.addWidget(QLabel("工程 JSON", objectName="sectionTitle"))
+        project_hint = QLabel(
+            "导出当前串口、轮询、解析、波形绑定和界面配置。JSON 可直接交给 AI 修改，再一键导入还原。"
+        )
+        project_hint.setWordWrap(True)
+        project_hint.setObjectName("muted")
+        layout.addWidget(project_hint)
+        project_actions = QHBoxLayout()
+        export_project = QPushButton("导出配置 JSON", objectName="primary")
+        export_project.clicked.connect(self._export_project_json)
+        import_project = QPushButton("导入配置 JSON")
+        import_project.clicked.connect(self._import_project_json)
+        project_actions.addWidget(export_project)
+        project_actions.addWidget(import_project)
+        layout.addLayout(project_actions)
+        safety_hint = QLabel("导入只恢复配置，不会自动连接串口、开始轮询或发送数据。")
+        safety_hint.setWordWrap(True)
+        safety_hint.setStyleSheet("color:#209567")
+        layout.addWidget(safety_hint)
         layout.addStretch()
         return page
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value, field: str) -> None:
+        index = combo.findData(value)
+        if index < 0:
+            raise ValueError(f"{field} 的值不受当前软件支持：{value!r}")
+        combo.setCurrentIndex(index)
+
+    def _project_document(self) -> dict:
+        """Capture configuration only; live samples and running state are excluded."""
+        view_names = ("frames", "raw", "overview", "waveform")
+        tab_names = ("receive", "poll", "parse", "write", "builder", "serial", "settings")
+        parser_documents = []
+        for config in self.parsers:
+            parser_documents.append({
+                "name": config["name"],
+                "type": config["type"],
+                "order": config["order"],
+                "source": config["source"],
+                "address": config["address"],
+                "function": config["function"],
+                "register": config["register"],
+                "offset": config["offset"],
+                "byte_lane": config.get("byte_lane", 0),
+                "count": config["count"],
+                "scale": config["scale"],
+                "color": config["color"],
+                "members": list(config["members"]),
+                "enabled": sorted(config["enabled"]),
+                "plots": sorted(config["plots"]),
+            })
+        return {
+            "schema": PROJECT_SCHEMA,
+            "version": PROJECT_VERSION,
+            "application": "Modbus Studio RTU",
+            "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "ai_help": {
+                "purpose": "可由人或 AI 编辑的 Modbus Studio 工程配置",
+                "safety": "导入不会自动连接串口、启动轮询、循环发送或写入设备",
+                "parser_addressing": "source=data 时 register 是绝对寄存器地址；count 是数值个数，不是寄存器个数",
+                "byte_orders": {"big": "ABCD", "little": "DCBA", "word_swap": "CDAB", "byte_swap": "BADC"},
+            },
+            "serial": self._serial_config(),
+            "poll": {
+                "address": self.poll_address.value(),
+                "function": self.poll_function.currentData(),
+                "start": self.poll_start.value(),
+                "quantity": self.poll_quantity.value(),
+                "interval_ms": self.poll_interval.value(),
+                "timeout_ms": self.poll_timeout.value(),
+            },
+            "parsers": parser_documents,
+            "parser_sequence": self._parser_sequence,
+            "receive": {
+                "address_filter": self.filter_address.value(),
+                "function_filter": self.filter_function.currentData(),
+                "crc_filter": self.filter_crc.currentIndex(),
+                "keyword": self.filter_keyword.text(),
+                "show_timestamp": self.show_timestamp.isChecked(),
+                "uppercase_hex": self.uppercase_hex.isChecked(),
+                "auto_scroll": self.auto_scroll.isChecked(),
+                "keep_limit": self.keep_limit.value(),
+            },
+            "write": {
+                "address": self.write_address.value(),
+                "target": self.write_target.currentData(),
+                "start": self.write_start.value(),
+                "type": self.write_type.currentText(),
+                "order": self.write_order.currentData(),
+                "values": self.write_values.toPlainText(),
+                "confirm": self.write_confirm.isChecked(),
+            },
+            "builder": {
+                "auto_address": self.auto_address.isChecked(),
+                "auto_function": self.auto_function.isChecked(),
+                "auto_crc": self.auto_crc.isChecked(),
+                "address": self.builder_address.value(),
+                "function": self.builder_function.currentData(),
+                "start": self.builder_start.value(),
+                "quantity": self.builder_quantity.value(),
+                "values": self.builder_values.text(),
+                "manual_hex": self.manual_hex.text(),
+                "repeat_interval_ms": self.repeat_interval.value(),
+            },
+            "ui": {
+                "theme": self.theme_combo.currentData() or "light",
+                "main_view": view_names[self.views.currentIndex()],
+                "right_tab": tab_names[self.right_tabs.currentIndex()],
+                "window_size": {"width": self.width(), "height": self.height()},
+                "splitter_sizes": self.body_splitter.sizes(),
+                "wave_view": self.live_plot.view_state(),
+            },
+        }
+
+    def _export_project_json(self) -> None:
+        default_name = datetime.now().strftime("modbus_project_%Y%m%d_%H%M%S.json")
+        target, _selected_filter = QFileDialog.getSaveFileName(
+            self, "导出工程配置", default_name, "JSON 配置 (*.json)"
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".json"):
+            target += ".json"
+        try:
+            document = validate_project(self._project_document())
+            destination = Path(target)
+            temporary = destination.with_name(destination.name + ".tmp")
+            temporary.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "JSON 导出失败", str(exc))
+            return
+        self.status_label.setText(f"工程配置已导出：{target}")
+
+    def _import_project_json(self) -> None:
+        source, _selected_filter = QFileDialog.getOpenFileName(
+            self, "导入工程配置", "", "JSON 配置 (*.json);;所有文件 (*)"
+        )
+        if not source:
+            return
+        try:
+            path = Path(source)
+            if path.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("配置文件超过 2 MiB，已拒绝导入")
+            document = validate_project(json.loads(path.read_text(encoding="utf-8-sig")))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self,
+                "JSON 配置有问题",
+                f"配置尚未应用，当前界面保持不变。\n\n{exc}\n\n可把此 JSON 和错误信息发给 AI 修复。",
+            )
+            return
+
+        if self.worker and self.worker.isRunning():
+            answer = QMessageBox.question(
+                self,
+                "导入配置",
+                "导入前需要断开当前串口，但不会自动重新连接。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.disconnect_serial()
+            if self.worker and self.worker.isRunning():
+                QMessageBox.warning(self, "无法导入", "串口线程尚未退出，请稍后重试。")
+                return
+        try:
+            self._apply_project_document(document)
+        except (ValueError, TypeError, KeyError) as exc:
+            # Validation is intentionally completed first, so this only catches a
+            # newer UI mismatch. It should never occur for files exported here.
+            QMessageBox.warning(self, "配置应用失败", f"当前版本无法应用此配置：{exc}")
+            return
+        self.status_label.setText(f"已还原工程配置：{source} · 串口未连接、轮询未启动")
+
+    def _apply_project_document(self, document: dict) -> None:
+        self._stop_polling(silent=True)
+        self.repeat_send.setChecked(False)
+        serial_config = document["serial"]
+        port = serial_config["port"]
+        port_index = self.port_combo.findData(port)
+        if port and port_index < 0:
+            self.port_combo.addItem(f"{port}  ·  配置中的设备（当前未发现）", port)
+            port_index = self.port_combo.count() - 1
+        if port_index >= 0:
+            self.port_combo.setCurrentIndex(port_index)
+        self.baud_combo.setCurrentText(str(serial_config["baudrate"]))
+        self.data_bits.setCurrentText(str(serial_config["bytesize"]))
+        self._set_combo_data(self.parity, serial_config["parity"], "serial.parity")
+        self._set_combo_data(self.stop_bits, serial_config["stopbits"], "serial.stopbits")
+        self.settings.save_serial_config(serial_config)
+
+        poll = document["poll"]
+        self.poll_address.setValue(poll["address"])
+        self._set_combo_data(self.poll_function, poll["function"], "poll.function")
+        self.poll_start.setValue(poll["start"])
+        self.poll_quantity.setValue(poll["quantity"])
+        self.poll_interval.setValue(poll["interval_ms"])
+        self.poll_timeout.setValue(poll["timeout_ms"])
+
+        receive = document["receive"]
+        self.filter_address.setValue(receive["address_filter"])
+        self._set_combo_data(self.filter_function, receive["function_filter"], "receive.function_filter")
+        self.filter_crc.setCurrentIndex(receive["crc_filter"])
+        self.filter_keyword.setText(receive["keyword"])
+        self.show_timestamp.setChecked(receive["show_timestamp"])
+        self.uppercase_hex.setChecked(receive["uppercase_hex"])
+        self.auto_scroll.setChecked(receive["auto_scroll"])
+        self.keep_limit.setValue(receive["keep_limit"])
+
+        self._clear_all_parsers()
+        self._parser_sequence = document.get("parser_sequence", len(document["parsers"]))
+        for saved in document["parsers"]:
+            config = dict(saved)
+            config["members"] = list(saved["members"])
+            config["enabled"] = set(saved["enabled"])
+            config["plots"] = set(saved["plots"])
+            self._insert_parser(config)
+            for index in set(range(config["count"])) - config["enabled"]:
+                item = config["member_items"].pop(index, None)
+                if item is not None and item is not config["item"]:
+                    config["item"].removeChild(item)
+            for index in config["plots"]:
+                self._register_parser_member(config, index)
+            self._refresh_parser_binding_text(config)
+
+        write = document["write"]
+        self.write_address.setValue(write["address"])
+        self._set_combo_data(self.write_target, write["target"], "write.target")
+        self.write_start.setValue(write["start"])
+        self.write_type.setCurrentText(write["type"])
+        self._set_combo_data(self.write_order, write["order"], "write.order")
+        self.write_values.setPlainText(write["values"])
+        self.write_confirm.setChecked(write["confirm"])
+
+        builder = document["builder"]
+        self.auto_address.setChecked(builder["auto_address"])
+        self.auto_function.setChecked(builder["auto_function"])
+        self.auto_crc.setChecked(builder["auto_crc"])
+        self.builder_address.setValue(builder["address"])
+        self._set_combo_data(self.builder_function, builder["function"], "builder.function")
+        self.builder_start.setValue(builder["start"])
+        self.builder_quantity.setValue(builder["quantity"])
+        self.builder_values.setText(builder["values"])
+        self.manual_hex.setText(builder["manual_hex"])
+        self.repeat_interval.setValue(builder["repeat_interval_ms"])
+
+        ui = document["ui"]
+        self._set_combo_data(self.theme_combo, ui["theme"], "ui.theme")
+        main_views = {"frames": 0, "raw": 1, "overview": 2, "waveform": 3}
+        right_tabs = {"receive": 0, "poll": 1, "parse": 2, "write": 3,
+                      "builder": 4, "serial": 5, "settings": 6}
+        self._switch_view(main_views[ui["main_view"]])
+        self.right_tabs.setCurrentIndex(right_tabs[ui["right_tab"]])
+        self.resize(ui["window_size"]["width"], ui["window_size"]["height"])
+        self.body_splitter.setSizes(ui["splitter_sizes"])
+        self.live_plot.restore_view_state(ui["wave_view"])
+        self._apply_filters()
+        self._update_builder()
+        self._update_write_preview()
 
     def _switch_view(self, index: int) -> None:
         self.views.setCurrentIndex(index)
         for i, button in enumerate(self.view_buttons):
             button.setChecked(i == index)
+        # One-shot contextual navigation: users can freely change the right tab afterwards.
+        if not hasattr(self, "right_tabs"):
+            return
+        target_page = self.receive_page if index in (0, 1) else self.parse_page
+        self.right_tabs.setCurrentWidget(target_page)
 
     def refresh_ports(self, manual: bool = False) -> None:
         ports = sorted(list_ports.comports(), key=lambda item: item.device)
@@ -698,10 +1307,12 @@ class MainWindow(QMainWindow):
             self.port_combo.addItem(label, port.device)
         if not ports:
             self.port_combo.addItem("未发现串口", "")
-        elif selected:
+        if selected:
             index = self.port_combo.findData(selected)
-            if index >= 0:
-                self.port_combo.setCurrentIndex(index)
+            if index < 0:
+                self.port_combo.addItem(f"{selected}  ·  已保存（当前未发现）", selected)
+                index = self.port_combo.count() - 1
+            self.port_combo.setCurrentIndex(index)
 
         devices = {item.device for item in ports}
         if connected_port and connected_port not in devices:
@@ -754,7 +1365,9 @@ class MainWindow(QMainWindow):
         self.repeat_send.setChecked(False)
         self._stop_polling(silent=True)
         if self.worker:
-            self.worker.stop()
+            if not self.worker.stop():
+                self.status_label.setText("串口线程仍在退出，请稍后重试")
+                return
             self.worker = None
         self._on_serial_status(False, "已断开")
 
@@ -779,9 +1392,21 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"串口错误：{message}")
         QMessageBox.warning(self, "串口错误", message)
 
-    def _on_bytes(self, chunk: bytes) -> None:
-        self.rx_bytes += len(chunk)
+    def _on_bytes(self, byte_count: int) -> None:
+        self.rx_bytes += byte_count
+        if not self.pause_button.isChecked():
+            self.rx_metric.setText(f"{self.rx_bytes:,}")
+
+    def _toggle_display_pause(self, paused: bool) -> None:
+        self.pause_button.setText("继续" if paused else "暂停")
+        if paused:
+            self.status_label.setText("显示已暂停 · 串口接收和安全轮询仍在后台运行")
+            return
         self.rx_metric.setText(f"{self.rx_bytes:,}")
+        self.tx_metric.setText(f"{self.tx_bytes:,}")
+        self.good_metric.setText(f"{self.good_frames:,}")
+        self.bad_metric.setText(f"{self.bad_frames:,}")
+        self.status_label.setText("显示已继续 · 等待下一帧数据")
 
     def _on_frame(self, raw: bytes, direction: str = "RX", poll_slot: str | None = None) -> None:
         frame = RtuFrame(raw, datetime.now(), direction)
@@ -792,12 +1417,17 @@ class MainWindow(QMainWindow):
                 and frame.function in (expected_function, expected_function | 0x80)
             ):
                 poll_slot = "rx"
-        if self.pause_button.isChecked() and direction == "RX":
+        if self.pause_button.isChecked():
             if frame.crc_ok:
-                self._parse_frame_channels(frame)
-            self._handle_poll_response(frame)
+                self.good_frames += 1
+            else:
+                self.bad_frames += 1
+            if direction == "RX":
+                self._handle_poll_response(frame)
             return
         self.frames.append(frame)
+        while len(self.frames) > self.keep_limit.value():
+            self.frames.popleft()
         if frame.crc_ok:
             self.good_frames += 1
         else:
@@ -825,7 +1455,7 @@ class MainWindow(QMainWindow):
         row[2].setData(frame.address, Qt.ItemDataRole.UserRole)
         row[3].setData(frame.function, Qt.ItemDataRole.UserRole)
         row[5].setData(frame.crc_ok, Qt.ItemDataRole.UserRole)
-        row[0].setData(len(self.frames) - 1, Qt.ItemDataRole.UserRole)
+        row[0].setData(frame, Qt.ItemDataRole.UserRole)
         if poll_slot:
             row[1].setData(poll_slot, Qt.ItemDataRole.UserRole + 1)
         color = QColor("#48d9c2" if direction == "RX" else "#68a7ff")
@@ -833,13 +1463,31 @@ class MainWindow(QMainWindow):
         row[5].setForeground(QColor("#68df95" if frame.crc_ok else "#ff7185"))
         stable_row = self._find_poll_row(poll_slot) if poll_slot else -1
         if stable_row >= 0:
-            for column, item in enumerate(row):
-                self.frame_model.setItem(stable_row, column, item)
+            # Keep the model items alive and update them in place. Replacing all seven
+            # items on every poll response made the row and selection visibly flash.
+            self.frame_table.setUpdatesEnabled(False)
+            try:
+                for column, new_item in enumerate(row):
+                    current = self.frame_model.item(stable_row, column)
+                    if current is None:
+                        self.frame_model.setItem(stable_row, column, new_item)
+                        continue
+                    if current.text() != new_item.text():
+                        current.setText(new_item.text())
+                    current.setData(new_item.data(Qt.ItemDataRole.UserRole), Qt.ItemDataRole.UserRole)
+                    current.setData(
+                        new_item.data(Qt.ItemDataRole.UserRole + 1),
+                        Qt.ItemDataRole.UserRole + 1,
+                    )
+                    current.setForeground(new_item.foreground())
+            finally:
+                self.frame_table.setUpdatesEnabled(True)
+                self.frame_table.viewport().update()
         else:
             self.frame_model.appendRow(row)
             self._trim_frame_rows()
 
-        self.raw_text.appendPlainText(f"{stamp}  {direction:<2}  {raw_hex}")
+        self._raw_pending.append(f"{stamp}  {direction:<2}  {raw_hex}")
         if direction == "RX" and frame.crc_ok:
             self._parse_frame_channels(frame)
         if direction == "RX":
@@ -847,11 +1495,37 @@ class MainWindow(QMainWindow):
         if self.auto_scroll.isChecked():
             if not poll_slot:
                 self.frame_table.scrollToBottom()
-            self.raw_text.verticalScrollBar().setValue(self.raw_text.verticalScrollBar().maximum())
+        self._overview_dirty = True
+        self._set_label_text(self.recent_address, address)
+        self._set_label_text(self.recent_function, function)
+        self._set_label_text(self.recent_bytes, str(len(raw)))
+        self._set_label_text(self.recent_crc, crc_label)
+        self.recent_crc.setStyleSheet(f"color:{'#259b65' if frame.crc_ok else '#df5262'}")
+
+    @staticmethod
+    def _set_label_text(label: QLabel, text: str) -> None:
+        """Avoid needless label relayout/repaint when a fixed field did not change."""
+        if label.text() != text:
+            label.setText(text)
+
+    def _flush_raw_output(self) -> None:
+        if not self._raw_pending:
+            return
+        pending = list(self._raw_pending)
+        self._raw_pending.clear()
+        self.raw_text.appendPlainText("\n".join(pending))
+        if self.auto_scroll.isChecked():
+            scrollbar = self.raw_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _flush_overview(self) -> None:
+        if self._wave_count_dirty:
+            self._wave_count_dirty = False
+            self.wave_record_count.setText(f"已记录 {len(self.wave_recorder):,} 行")
+        if not self._overview_dirty:
+            return
+        self._overview_dirty = False
         self._update_byte_overview()
-        self.status_label.setText(
-            f"最近帧：站号 {address} · {function} · {len(raw)} bytes · CRC {crc_label}"
-        )
 
     def _find_poll_row(self, slot: str | None) -> int:
         if not slot:
@@ -895,10 +1569,9 @@ class MainWindow(QMainWindow):
         if not indexes:
             return
         source_index = self.frame_filter.mapToSource(indexes[0])
-        frame_index = self.frame_model.item(source_index.row(), 0).data(Qt.ItemDataRole.UserRole)
-        if frame_index is None or frame_index >= len(self.frames):
+        frame = self.frame_model.item(source_index.row(), 0).data(Qt.ItemDataRole.UserRole)
+        if not isinstance(frame, RtuFrame):
             return
-        frame = self.frames[frame_index]
         crc_received = int.from_bytes(frame.raw[-2:], "little") if len(frame.raw) >= 2 else 0
         lines = [
             f"时间     {frame.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}",
@@ -912,7 +1585,7 @@ class MainWindow(QMainWindow):
         self.detail_text.setPlainText("\n".join(lines))
 
     def _update_byte_overview(self) -> None:
-        sample = b"".join(frame.raw for frame in self.frames[-200:])
+        sample = b"".join(frame.raw for frame in list(self.frames)[-200:])
         if not sample:
             self.byte_overview.clear()
             return
@@ -986,6 +1659,14 @@ class MainWindow(QMainWindow):
             self._stop_polling(silent=True)
             return
         try:
+            # Rebuild for every cycle so parser-created range expansions take effect
+            # on the next request without interrupting an active polling session.
+            self.poll_request = build_request(
+                self.poll_address.value(),
+                self.poll_function.currentData(),
+                self.poll_start.value(),
+                self.poll_quantity.value(),
+            )
             self.worker.send(self.poll_request)
         except serial.SerialException as exc:
             self._on_serial_error(str(exc))
@@ -995,6 +1676,7 @@ class MainWindow(QMainWindow):
         self.tx_metric.setText(f"{self.tx_bytes:,}")
         self._on_frame(self.poll_request, "TX", poll_slot="tx")
         self.poll_waiting = True
+        self.poll_sent_quantity = self.poll_quantity.value()
         self.poll_sent_at = time.perf_counter()
         self.poll_timeout_timer.start(self.poll_timeout.value())
         self.poll_status.setText(
@@ -1013,9 +1695,9 @@ class MainWindow(QMainWindow):
         self.poll_waiting = False
         elapsed_ms = (time.perf_counter() - self.poll_sent_at) * 1000
         data_bytes = (
-            (self.poll_quantity.value() + 7) // 8
+            (self.poll_sent_quantity + 7) // 8
             if expected_function in (1, 2)
-            else self.poll_quantity.value() * 2
+            else self.poll_sent_quantity * 2
         )
         expected_length = data_bytes + 5
         if frame.crc_ok and frame.function == expected_function and len(frame.raw) == expected_length:
@@ -1043,13 +1725,57 @@ class MainWindow(QMainWindow):
         function = self.poll_function.currentData()
         self.poll_quantity.setMaximum(2000 if function in (1, 2) else 125)
 
+    def _update_parser_offset_hint(self, *_args) -> None:
+        if not hasattr(self, "parser_offset_hint"):
+            return
+        size = type_size(self.parser_type.currentText())
+        is_8bit = size == 1
+        data_source = self.parser_source.currentData() == "data"
+        self.parser_byte_lane.setEnabled(is_8bit and data_source)
+        self.parser_form.setRowVisible(self.parser_byte_lane, is_8bit and data_source)
+        if self.parser_source.currentData() == "data":
+            register_step = max(1, (size + 1) // 2)
+            self.parser_offset.setSingleStep(register_step)
+            first_register = self.parser_offset.value()
+            lane = self.parser_byte_lane.currentData() if is_8bit else 0
+            total_bytes = size * self.parser_count.value()
+            last_register = first_register + (lane + total_bytes - 1) // 2
+            internal_offset = (first_register - self.poll_start.value()) * 2 + lane
+            self.parser_offset_label.setText("起始寄存器")
+            location = (
+                f"R{first_register}" if last_register == first_register
+                else f"R{first_register}～R{last_register}"
+            )
+            validity = "" if internal_offset >= 0 else "；注意：该地址小于当前轮询起点"
+            self.parser_offset_hint.setText(
+                f"将解析 {location}；解析数量表示数值个数。"
+                f"{self.parser_type.currentText()} 每个占 {register_step} 个寄存器，"
+                f"轮询范围会自动补足{validity}。"
+            )
+        else:
+            self.parser_offset.setSingleStep(size)
+            start = self.parser_offset.value()
+            end = start + size * self.parser_count.value() - 1
+            self.parser_offset_label.setText("完整帧字节偏移")
+            self.parser_offset_hint.setText(
+                f"解析完整RTU帧 Byte {start}～{end}。"
+                "完整帧包含从站地址、功能码、长度/负载和CRC，通常建议改用“Modbus数据区”。"
+            )
+
+    def _sync_parser_register_with_poll(self, new_start: int) -> None:
+        if hasattr(self, "parser_offset") and self.parser_offset.value() == self._last_poll_start:
+            self.parser_offset.setValue(new_start)
+        self._last_poll_start = new_start
+        self._update_parser_offset_hint()
+
     def _add_parser(self) -> None:
         try:
             scale = float(self.parser_scale.text().strip() or "1")
         except ValueError:
             QMessageBox.information(self, "缩放倍率无效", "缩放倍率必须是数字，例如 1、0.1 或 10。")
             return
-        base_name = self.parser_name.text().strip() or f"通道 {len(self.parsers) + 1}"
+        self._parser_sequence += 1
+        base_name = self.parser_name.text().strip() or f"通道 {self._parser_sequence}"
         existing = {config["name"] for config in self.parsers}
         name = base_name
         suffix = 2
@@ -1063,63 +1789,261 @@ class MainWindow(QMainWindow):
             "source": self.parser_source.currentData(),
             "address": self.parser_address.value(),
             "function": self.parser_function.currentData(),
+            "register": self.parser_offset.value(),
             "offset": self.parser_offset.value(),
+            "byte_lane": self.parser_byte_lane.currentData(),
             "count": self.parser_count.value(),
             "scale": scale,
-            "plot": self.parser_bind_plot.isChecked(),
             "color": self.parser_colors[len(self.parsers) % len(self.parser_colors)],
         }
+        config["members"] = [name] if config["count"] == 1 else [
+            f"成员 {index}" for index in range(config["count"])
+        ]
+        config["plots"] = set()
+        config["enabled"] = set(range(config["count"]))
+        range_message = self._expand_poll_range_for_parser(config)
         self._insert_parser(config)
         self.parser_name.clear()
-        self.status_label.setText(f"已添加解析通道“{name}”")
-        if config["plot"]:
-            self._switch_view(3)
+        self.status_label.setText(f"已添加解析通道“{name}”{range_message}")
+
+    def _expand_poll_range_for_parser(self, config: dict) -> str:
+        """Ensure a register poll includes every byte needed by a new parser."""
+        if config["source"] != "data" or self.poll_function.currentData() not in (3, 4):
+            return ""
+        size = type_size(config["type"])
+        lane = config.get("byte_lane", 0) if size == 1 else 0
+        parser_start = config["register"]
+        poll_start = self.poll_start.value()
+        if parser_start < poll_start:
+            return "；地址小于当前轮询起点，请调整轮询范围"
+        required_end = parser_start + (lane + size * config["count"] + 1) // 2
+        required_quantity = required_end - poll_start
+        if required_quantity <= self.poll_quantity.value():
+            return ""
+        if required_quantity > 125:
+            return f"；需要读取 {required_quantity} 个寄存器，超过单帧上限125"
+        self.poll_quantity.setValue(required_quantity)
+        suffix = "，下一轮生效" if self.poll_active else ""
+        return f"；轮询数量已自动扩大为 {required_quantity}{suffix}"
 
     def _insert_parser(self, config: dict) -> None:
         self.parsers.append(config)
-        row = self.parser_table.rowCount()
-        self.parser_table.insertRow(row)
-        name_item = QTableWidgetItem(config["name"])
-        name_item.setForeground(QColor(config["color"]))
-        self.parser_table.setItem(row, 0, name_item)
-        self.parser_table.setItem(row, 1, QTableWidgetItem(config["type"]))
-        self.parser_table.setItem(row, 2, QTableWidgetItem("等待数据"))
-        self.parser_table.setItem(row, 3, QTableWidgetItem("●" if config["plot"] else "—"))
+        uid = id(config)
+        is_single = config["count"] == 1
+        root = QTreeWidgetItem([
+            config["name"],
+            self._parser_member_location(config, 0) if is_single else f"{config['type']} × {config['count']}",
+            "等待数据",
+            "未绑定" if is_single else "0 个已绑定",
+        ])
+        root.setData(0, Qt.ItemDataRole.UserRole, uid)
+        root.setData(0, Qt.ItemDataRole.UserRole + 1, 0 if is_single else -1)
+        root.setForeground(0, QColor(config["color"]))
+        self.parser_tree.addTopLevelItem(root)
+        config["item"] = root
+        config["member_items"] = {}
+        if is_single:
+            config["member_items"][0] = root
+            return
+        for index, member_name in enumerate(config["members"]):
+            item = QTreeWidgetItem([member_name, self._parser_member_location(config, index), "等待数据", "未绑定"])
+            item.setData(0, Qt.ItemDataRole.UserRole, uid)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, index)
+            root.addChild(item)
+            config["member_items"][index] = item
+        root.setExpanded(True)
+
+    def _parser_member_location(self, config: dict, index: int) -> str:
+        size = type_size(config["type"])
+        if config["source"] == "frame":
+            return f"Byte {config['offset'] + index * size} · {config['type']}"
+        byte_index = config.get("byte_lane", 0) + index * size
+        register = config["register"] + byte_index // 2
+        lane = ".H" if byte_index % 2 == 0 else ".L"
+        suffix = lane if size == 1 else ""
+        return f"R{register}{suffix} · {config['type']}"
+
+    def _parser_for_item(self, item: QTreeWidgetItem | None) -> tuple[dict | None, int]:
+        if item is None:
+            return None, -1
+        uid = item.data(0, Qt.ItemDataRole.UserRole)
+        member_data = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        member = int(member_data) if member_data is not None else -1
+        return next((config for config in self.parsers if id(config) == uid), None), member
+
+    def _series_name(self, config: dict, index: int) -> str:
+        if config["count"] == 1:
+            return config["name"]
+        return f"{config['name']}.{config['members'][index]}"
+
+    def _register_parser_member(self, config: dict, index: int) -> None:
+        color_index = (self.parsers.index(config) + index) % len(self.parser_colors)
+        color = self.parser_colors[color_index]
+        self.live_plot.register_series(self._series_name(config, index), color)
+
+    def _refresh_parser_binding_text(self, config: dict) -> None:
+        plots = config["plots"]
+        if config["count"] == 1:
+            config["item"].setText(3, "● 波形调试" if plots else "未绑定")
+            config["item"].setForeground(3, QColor(config["color"]) if plots else QColor())
+            return
+        config["item"].setText(3, f"{len(plots)} 个已绑定" if plots else "未绑定")
+        for index, item in config["member_items"].items():
+            item.setText(3, "● 波形调试" if index in plots else "未绑定")
+            item.setForeground(3, QColor(config["color"]) if index in plots else QColor())
+
+    def _show_parser_context_menu(self, position) -> None:
+        item = self.parser_tree.itemAt(position)
+        config, member = self._parser_for_item(item)
+        if config is None:
+            return
+        self.parser_tree.setCurrentItem(item)
+        menu = QMenu(self)
+        is_structure = member < 0
+        if is_structure:
+            bind_action = menu.addAction("全部添加到波形调试")
+            unbind_action = menu.addAction("全部移出波形调试")
+            rename_action = menu.addAction("重命名结构")
+        else:
+            bind_action = menu.addAction("添加到波形调试")
+            unbind_action = menu.addAction("移出波形调试")
+            rename_action = menu.addAction("重命名变量" if config["count"] == 1 else "重命名成员")
+            bind_action.setEnabled(member not in config["plots"])
+            unbind_action.setEnabled(member in config["plots"])
+        menu.addSeparator()
+        delete_action = menu.addAction("删除结构" if is_structure else ("删除变量" if config["count"] == 1 else "删除此成员"))
+        chosen = menu.exec(self.parser_tree.viewport().mapToGlobal(position))
+        if chosen == bind_action:
+            indices = config["enabled"] if member < 0 else {member}
+            for index in indices:
+                config["plots"].add(index)
+                self._register_parser_member(config, index)
+            self._refresh_parser_binding_text(config)
+            self.status_label.setText(f"“{config['name']}”已添加到波形调试")
+        elif chosen == unbind_action:
+            indices = set(config["plots"]) if member < 0 else {member}
+            for index in indices:
+                config["plots"].discard(index)
+                self.live_plot.remove_series(self._series_name(config, index))
+            self._refresh_parser_binding_text(config)
+            self.status_label.setText(f"已更新“{config['name']}”的波形绑定")
+        elif chosen == rename_action:
+            self._rename_parser_item(config, member)
+        elif chosen == delete_action:
+            self._remove_parser_item(config, member)
 
     def _remove_parser(self) -> None:
-        row = self.parser_table.currentRow()
-        if row < 0 or row >= len(self.parsers):
+        config, member = self._parser_for_item(self.parser_tree.currentItem())
+        if config is None:
             return
-        config = self.parsers.pop(row)
-        self.parser_table.removeRow(row)
-        self.live_plot.remove_series(config["name"])
-        self.status_label.setText(f"已删除解析通道“{config['name']}”")
+        self._remove_parser_item(config, member)
+
+    def _clear_all_parsers(self) -> None:
+        """Remove every parser and waveform binding in one operation."""
+        self.parsers.clear()
+        self.parser_tree.clear()
+        self.live_plot.clear_all_series()
+        self.wave_recorder.clear()
+        self._wave_count_dirty = False
+        self.wave_record_count.setText("已记录 0 行")
+        self.status_label.setText("已清空全部解析通道和波形绑定")
+
+    def _remove_parser_item(self, config: dict, member: int) -> None:
+        if member < 0 or config["count"] == 1:
+            self.parsers.remove(config)
+            self.parser_tree.takeTopLevelItem(self.parser_tree.indexOfTopLevelItem(config["item"]))
+            self.live_plot.remove_series(config["name"])
+            self.status_label.setText(f"已删除解析结构“{config['name']}”")
+            return
+        config["enabled"].discard(member)
+        config["plots"].discard(member)
+        self.live_plot.remove_series(self._series_name(config, member))
+        item = config["member_items"].pop(member)
+        config["item"].removeChild(item)
+        self._refresh_parser_binding_text(config)
+        self.status_label.setText(f"已删除成员“{config['members'][member]}”")
+
+    def _rename_parser_from_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
+        config, member = self._parser_for_item(item)
+        if config is not None:
+            self._rename_parser_item(config, member)
+
+    def _rename_parser_item(self, config: dict, member: int) -> None:
+        is_single = config["count"] == 1
+        old_name = config["name"] if member < 0 or is_single else config["members"][member]
+        new_name, accepted = QInputDialog.getText(self, "重命名", "名称", text=old_name)
+        new_name = new_name.strip()
+        if not accepted or not new_name or new_name == old_name:
+            return
+        old_series = {index: self._series_name(config, index) for index in config["plots"]}
+        if member < 0 or is_single:
+            config["name"] = new_name
+            if is_single:
+                config["members"][0] = new_name
+            config["item"].setText(0, new_name)
+        else:
+            config["members"][member] = new_name
+            config["member_items"][member].setText(0, new_name)
+        for index, previous_name in old_series.items():
+            self.live_plot.rename_series(previous_name, self._series_name(config, index))
+        self.status_label.setText(f"已重命名为“{new_name}”")
 
     def _parse_frame_channels(self, frame: RtuFrame) -> None:
-        for row, config in enumerate(self.parsers):
+        waveform_values: dict[str, float | int] = {}
+        for config in self.parsers:
             if config["address"] and frame.address != config["address"]:
                 continue
             if config["function"] >= 0 and frame.function != config["function"]:
                 continue
             source = frame.raw if config["source"] == "frame" else modbus_data_area(frame.raw)
+            offset = config["offset"]
+            if config["source"] == "data":
+                lane = config.get("byte_lane", 0) if type_size(config["type"]) == 1 else 0
+                offset = (config["register"] - self.poll_start.value()) * 2 + lane
             try:
                 values = parse_typed_values(
                     source,
                     config["type"],
-                    config["offset"],
+                    offset,
                     config["count"],
                     config["order"],
                     config["scale"],
                 )
             except ValueError as exc:
-                self.parser_table.setItem(row, 2, QTableWidgetItem(f"等待 · {exc}"))
+                message = f"等待数据 · {exc}"
+                self._set_tree_text(config["item"], 2, "等待数据")
+                if config["item"].toolTip(2) != message:
+                    config["item"].setToolTip(2, message)
+                for item in config["member_items"].values():
+                    self._set_tree_text(item, 2, "等待数据")
+                    if item.toolTip(2) != message:
+                        item.setToolTip(2, message)
                 continue
             display = ", ".join(f"{value:.6g}" if isinstance(value, float) else str(value) for value in values)
-            self.parser_table.setItem(row, 2, QTableWidgetItem(display))
-            if config["plot"]:
-                for index, value in enumerate(values):
-                    series_name = config["name"] if len(values) == 1 else f"{config['name']}[{index}]"
-                    self.live_plot.add_sample(series_name, float(value), config["color"])
+            self._set_tree_text(config["item"], 2, display if len(display) < 48 else display[:47] + "…")
+            if config["item"].toolTip(2) != display:
+                config["item"].setToolTip(2, display)
+            for index, value in enumerate(values):
+                if index not in config["enabled"]:
+                    continue
+                item = config["member_items"].get(index)
+                if item:
+                    self._set_tree_text(item, 2, f"{value:.8g}" if isinstance(value, float) else str(value))
+                    if item.toolTip(2):
+                        item.setToolTip(2, "")
+                if index in config["plots"]:
+                    series_name = self._series_name(config, index)
+                    color_index = (self.parsers.index(config) + index) % len(self.parser_colors)
+                    self.live_plot.add_sample(series_name, float(value), self.parser_colors[color_index])
+                    waveform_values[series_name] = value
+        if waveform_values:
+            self.wave_recorder.append(frame.timestamp, waveform_values)
+            self._wave_count_dirty = True
+
+    @staticmethod
+    def _set_tree_text(item: QTreeWidgetItem, column: int, text: str) -> None:
+        if item.text(column) != text:
+            item.setText(column, text)
 
     def _builder_mode_changed(self) -> None:
         automatic = self.auto_address.isChecked() and self.auto_function.isChecked()
@@ -1211,6 +2135,8 @@ class MainWindow(QMainWindow):
 
     def clear_data(self) -> None:
         self.frames.clear()
+        self._raw_pending.clear()
+        self._overview_dirty = False
         self.frame_model.removeRows(0, self.frame_model.rowCount())
         if self.poll_active:
             self._ensure_poll_rows()
@@ -1218,11 +2144,21 @@ class MainWindow(QMainWindow):
         self.detail_text.clear()
         self.byte_overview.clear()
         self.live_plot.clear()
-        for row in range(self.parser_table.rowCount()):
-            self.parser_table.setItem(row, 2, QTableWidgetItem("等待数据"))
+        self.wave_recorder.clear()
+        self._wave_count_dirty = False
+        self.wave_record_count.setText("已记录 0 行")
+        for config in self.parsers:
+            config["item"].setText(2, "等待数据")
+            for item in config["member_items"].values():
+                item.setText(2, "等待数据")
         self.rx_bytes = self.tx_bytes = self.good_frames = self.bad_frames = 0
         for label in (self.rx_metric, self.tx_metric, self.good_metric, self.bad_metric):
             label.setText("0")
+        self._set_label_text(self.recent_address, "---")
+        self._set_label_text(self.recent_function, "等待数据")
+        self._set_label_text(self.recent_bytes, "0")
+        self._set_label_text(self.recent_crc, "---")
+        self.recent_crc.setStyleSheet("")
         self.status_label.setText("数据已清空")
 
     def _restore_settings(self) -> None:
@@ -1249,6 +2185,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self.settings.set("window/geometry", self.saveGeometry())
+        self._stop_polling(silent=True)
         if self.worker:
-            self.worker.stop()
+            if not self.worker.stop():
+                self.status_label.setText("串口线程仍在退出，请稍后再关闭")
+                event.ignore()
+                return
+        if self.export_worker and self.export_worker.isRunning():
+            if not self.export_worker.wait(3000):
+                self.status_label.setText("CSV仍在导出，请稍后再关闭")
+                event.ignore()
+                return
         event.accept()

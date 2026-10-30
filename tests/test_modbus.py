@@ -1,6 +1,6 @@
 import pytest
 
-from modbus_tool.core.data_parser import modbus_data_area, parse_typed_values
+from modbus_tool.core.data_parser import encode_typed_values, modbus_data_area, parse_typed_values
 from modbus_tool.core.modbus import append_crc, build_request, check_crc, crc16, parse_hex
 
 
@@ -37,6 +37,8 @@ def test_validation():
         build_request(0, 3, 0, 1)
     with pytest.raises(ValueError):
         build_request(1, 5, 0, values=[2])
+    with pytest.raises(ValueError):
+        build_request(1, 16, 65535, values=[1, 2])
 
 
 def test_parse_typed_register_values():
@@ -55,3 +57,13 @@ def test_parse_little_endian_and_scale():
 def test_extract_modbus_data_area():
     frame = append_crc(bytes.fromhex("01 03 04 00 64 00 C8"))
     assert modbus_data_area(frame) == bytes.fromhex("00 64 00 C8")
+
+
+@pytest.mark.parametrize("order", ["big", "little", "word_swap", "byte_swap"])
+def test_typed_encode_round_trip(order):
+    encoded = encode_typed_values([12.5, -3.25], "float32", order)
+    assert parse_typed_values(encoded, "float32", count=2, byte_order=order) == pytest.approx([12.5, -3.25])
+
+
+def test_typed_encode_signed_register():
+    assert encode_typed_values([-1], "int16") == bytes.fromhex("FF FF")

@@ -125,6 +125,8 @@ def build_request(
         limit = 2000 if function in (1, 2) else 125
         if not 1 <= quantity <= limit:
             raise ValueError(f"读取数量范围为 1–{limit}")
+        if start + quantity > 0x10000:
+            raise ValueError("读取范围超过寄存器/线圈地址上限 65535")
         pdu += quantity.to_bytes(2, "big")
     elif function == 5:
         if not values or values[0] not in (0, 1, 0x0000, 0xFF00):
@@ -137,6 +139,8 @@ def build_request(
     elif function == 15:
         if not values or len(values) > 1968:
             raise ValueError("请输入 1–1968 个线圈值")
+        if start + len(values) > 0x10000:
+            raise ValueError("写入范围超过线圈地址上限 65535")
         packed = bytearray((len(values) + 7) // 8)
         for index, value in enumerate(values):
             if value not in (0, 1):
@@ -147,6 +151,8 @@ def build_request(
     elif function == 16:
         if not values or len(values) > 123 or any(not 0 <= v <= 0xFFFF for v in values):
             raise ValueError("请输入 1–123 个 0–65535 的寄存器值")
+        if start + len(values) > 0x10000:
+            raise ValueError("写入范围超过寄存器地址上限 65535")
         body = b"".join(value.to_bytes(2, "big") for value in values)
         pdu += len(values).to_bytes(2, "big") + bytes((len(body),)) + body
     else:
