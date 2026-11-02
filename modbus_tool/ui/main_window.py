@@ -16,6 +16,7 @@ from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -93,9 +94,9 @@ class FrameFilter(QSortFilterProxyModel):
         model = self.sourceModel()
         if model is None:
             return True
-        addr = model.index(source_row, 2, source_parent).data(Qt.ItemDataRole.UserRole)
-        func = model.index(source_row, 3, source_parent).data(Qt.ItemDataRole.UserRole)
-        crc_ok = model.index(source_row, 5, source_parent).data(Qt.ItemDataRole.UserRole)
+        addr = model.index(source_row, 3, source_parent).data(Qt.ItemDataRole.UserRole)
+        func = model.index(source_row, 4, source_parent).data(Qt.ItemDataRole.UserRole)
+        crc_ok = model.index(source_row, 6, source_parent).data(Qt.ItemDataRole.UserRole)
         row_text = " ".join(
             str(model.index(source_row, col, source_parent).data() or "")
             for col in range(model.columnCount())
@@ -134,6 +135,11 @@ class MainWindow(QMainWindow):
         self.poll_sent_at = 0.0
         self.poll_request = b""
         self.poll_sent_quantity = 0
+        self.poll_tasks: list[dict] = []
+        self.poll_task_sequence = 0
+        self.poll_current_task: dict | None = None
+        self.poll_manual_once = False
+        self._poll_form_loading = False
         self.wave_recorder = WaveRecorder(max_rows=200_000)
         self.alarm_rules: list[AlarmRule] = []
         self.alarm_events: deque[AlarmEvent] = deque(maxlen=50_000)
@@ -205,6 +211,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(title_box)
         layout.addStretch()
 
+        import_project = QPushButton("导入 JSON")
+        import_project.setToolTip("导入工程配置，不会自动连接串口或启动轮询")
+        import_project.clicked.connect(self._import_project_json)
+        layout.addWidget(import_project)
+
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(150)
         self.port_combo.setToolTip("可用串口")
@@ -274,9 +285,9 @@ class MainWindow(QMainWindow):
         page_layout.setSpacing(0)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        self.frame_model = QStandardItemModel(0, 7, self)
+        self.frame_model = QStandardItemModel(0, 8, self)
         self.frame_model.setHorizontalHeaderLabels(
-            ["时间", "方向", "站号", "功能", "摘要", "CRC", "原始帧"]
+            ["ID", "时间", "方向", "站号", "功能", "摘要", "CRC", "原始帧"]
         )
         self.frame_filter = FrameFilter(self)
         self.frame_filter.setSourceModel(self.frame_model)
@@ -287,13 +298,14 @@ class MainWindow(QMainWindow):
         self.frame_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.frame_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.frame_table.verticalHeader().hide()
-        self.frame_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.frame_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.frame_table.setColumnWidth(0, 105)
-        self.frame_table.setColumnWidth(1, 58)
-        self.frame_table.setColumnWidth(2, 62)
-        self.frame_table.setColumnWidth(3, 135)
-        self.frame_table.setColumnWidth(5, 70)
+        self.frame_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.frame_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.frame_table.setColumnWidth(0, 58)
+        self.frame_table.setColumnWidth(1, 105)
+        self.frame_table.setColumnWidth(2, 58)
+        self.frame_table.setColumnWidth(3, 62)
+        self.frame_table.setColumnWidth(4, 135)
+        self.frame_table.setColumnWidth(6, 70)
         self.frame_table.selectionModel().selectionChanged.connect(self._show_selected_frame)
         splitter.addWidget(self.frame_table)
 
@@ -823,7 +835,6 @@ class MainWindow(QMainWindow):
         self.write_page = self._build_write_tab()
         self.right_tabs.addTab(self.write_page, "写入")
         self.right_tabs.addTab(self._build_send_tab(), "构帧")
-        self.right_tabs.addTab(self._build_serial_tab(), "串口")
         self.right_tabs.addTab(self._build_settings_tab(), "设置")
         return self.right_tabs
 
@@ -843,8 +854,37 @@ class MainWindow(QMainWindow):
     def _build_poll_tab(self) -> QWidget:
         page, layout = self._tab_page()
         layout.addWidget(QLabel("连续读取轮询", objectName="sectionTitle"))
-        layout.addWidget(QLabel("严格按“请求 → 等待响应 → 再请求”运行", objectName="muted"))
+        layout.addWidget(QLabel("多个轮询项按“请求 → 等待响应 → 下一项”自动调度", objectName="muted"))
+        self.poll_task_tree = QTreeWidget()
+        self.poll_task_tree.setColumnCount(3)
+        self.poll_task_tree.setHeaderLabels(["ID", "名称", "范围"])
+        self.poll_task_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.poll_task_tree.header().resizeSection(0, 48)
+        self.poll_task_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.poll_task_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.poll_task_tree.header().resizeSection(2, 105)
+        self.poll_task_tree.setRootIsDecorated(False)
+        self.poll_task_tree.setMinimumHeight(112)
+        self.poll_task_tree.setMaximumHeight(175)
+        self.poll_task_tree.currentItemChanged.connect(self._poll_task_selected)
+        layout.addWidget(self.poll_task_tree)
+        task_actions = QHBoxLayout()
+        self.poll_add_button = QPushButton("新增")
+        self.poll_add_button.clicked.connect(self._add_poll_task)
+        self.poll_copy_button = QPushButton("复制")
+        self.poll_copy_button.clicked.connect(self._copy_poll_task)
+        self.poll_delete_button = QPushButton("删除", objectName="danger")
+        self.poll_delete_button.clicked.connect(self._delete_poll_task)
+        self.poll_once_button = QPushButton("立即一次")
+        self.poll_once_button.clicked.connect(self._run_selected_poll_once)
+        for button in (self.poll_add_button, self.poll_copy_button, self.poll_delete_button, self.poll_once_button):
+            task_actions.addWidget(button)
+        layout.addLayout(task_actions)
         form = QFormLayout()
+        self.poll_name = QLineEdit()
+        self.poll_name.setPlaceholderText("例如：温度区")
+        self.poll_enabled = QCheckBox("启用此轮询项")
+        self.poll_enabled.setChecked(True)
         self.poll_address = QSpinBox()
         self.poll_address.setRange(1, 247)
         self.poll_address.setValue(1)
@@ -868,18 +908,23 @@ class MainWindow(QMainWindow):
         self.poll_timeout.setRange(50, 10000)
         self.poll_timeout.setValue(500)
         self.poll_timeout.setSuffix(" ms")
+        self.poll_range_mode = QComboBox()
+        self.poll_range_mode.addItem("自动扩展", "auto")
+        self.poll_range_mode.addItem("手动固定", "manual")
+        form.addRow("任务名称", self.poll_name)
+        form.addRow("状态", self.poll_enabled)
         form.addRow("从站地址", self.poll_address)
         form.addRow("读取功能", self.poll_function)
+        form.addRow("范围模式", self.poll_range_mode)
         form.addRow("起始寄存器", self.poll_start)
         form.addRow("寄存器数量", self.poll_quantity)
         form.addRow("响应后间隔", self.poll_interval)
         form.addRow("响应超时", self.poll_timeout)
         layout.addLayout(form)
 
-        poll_hint = QLabel("解析通道直接填写绝对寄存器地址；软件会根据本轮询起点自动定位数据。")
-        poll_hint.setWordWrap(True)
-        poll_hint.setObjectName("muted")
-        layout.addWidget(poll_hint)
+        self.poll_button = QPushButton("开始安全轮询", objectName="primary")
+        self.poll_button.clicked.connect(self._toggle_polling)
+        layout.addWidget(self.poll_button)
 
         poll_status_card = QFrame(objectName="pollStatusCard")
         status_grid = QGridLayout(poll_status_card)
@@ -914,11 +959,8 @@ class MainWindow(QMainWindow):
         for column, width in enumerate((36, 80, 36, 64, 84, 96)):
             status_grid.setColumnMinimumWidth(column, width)
         status_grid.setColumnStretch(1, 1)
-        layout.addWidget(poll_status_card)
         layout.addStretch()
-        self.poll_button = QPushButton("开始安全轮询", objectName="primary")
-        self.poll_button.clicked.connect(self._toggle_polling)
-        layout.addWidget(self.poll_button)
+        layout.addWidget(poll_status_card)
 
         self.poll_next_timer = QTimer(self)
         self.poll_next_timer.setSingleShot(True)
@@ -926,6 +968,19 @@ class MainWindow(QMainWindow):
         self.poll_timeout_timer = QTimer(self)
         self.poll_timeout_timer.setSingleShot(True)
         self.poll_timeout_timer.timeout.connect(self._poll_timed_out)
+        for signal in (
+            self.poll_name.textChanged,
+            self.poll_enabled.toggled,
+            self.poll_address.valueChanged,
+            self.poll_function.currentIndexChanged,
+            self.poll_range_mode.currentIndexChanged,
+            self.poll_start.valueChanged,
+            self.poll_quantity.valueChanged,
+            self.poll_interval.valueChanged,
+            self.poll_timeout.valueChanged,
+        ):
+            signal.connect(self._poll_form_changed)
+        self._create_poll_task(select=True)
         return page
 
     def _build_parse_tab(self) -> QWidget:
@@ -940,6 +995,8 @@ class MainWindow(QMainWindow):
         self.parser_form = form
         self.parser_name = QLineEdit()
         self.parser_name.setPlaceholderText("例：温度")
+        self.parser_poll_task = QComboBox()
+        self._refresh_parser_poll_sources()
         self.parser_type = QComboBox()
         self.parser_type.addItems(
             ["uint8", "int8", "uint16", "int16", "uint32", "int32", "float32", "float64"]
@@ -963,7 +1020,7 @@ class MainWindow(QMainWindow):
         self.parser_offset.setRange(0, 65535)
         self.parser_offset.setValue(self.poll_start.value())
         self.parser_offset.setToolTip("填写设备手册中的绝对寄存器地址，例如1103；float32下一项通常为1105")
-        self.parser_offset_label = QLabel("起始寄存器")
+        self.parser_offset_label = QLabel("数据块起点")
         self.parser_byte_lane = QComboBox()
         self.parser_byte_lane.addItem("高字节", 0)
         self.parser_byte_lane.addItem("低字节", 1)
@@ -973,27 +1030,28 @@ class MainWindow(QMainWindow):
         self.parser_scale = QLineEdit("1.0")
         self.parser_scale.setPlaceholderText("倍率，例如 0.1")
         form.addRow("通道名称", self.parser_name)
+        form.addRow("数据块 ID", self.parser_poll_task)
         form.addRow("数据类型", self.parser_type)
+        form.addRow(self.parser_offset_label, self.parser_offset)
+        form.addRow("解析数量", self.parser_count)
         form.addRow("字节序", self.parser_order)
+        form.addRow("8位字节位置", self.parser_byte_lane)
+        form.addRow("缩放倍率", self.parser_scale)
         form.addRow("数据来源", self.parser_source)
         form.addRow("从站过滤", self.parser_address)
         form.addRow("功能过滤", self.parser_function)
-        form.addRow(self.parser_offset_label, self.parser_offset)
-        form.addRow("8位字节位置", self.parser_byte_lane)
-        form.addRow("解析数量", self.parser_count)
-        form.addRow("缩放倍率", self.parser_scale)
         layout.addLayout(form)
         self.parser_offset_hint = QLabel()
         self.parser_offset_hint.setWordWrap(True)
         self.parser_offset_hint.setStyleSheet("background:#e7f4f8;color:#187195;padding:8px;border-radius:6px")
         layout.addWidget(self.parser_offset_hint)
         self.parser_type.currentTextChanged.connect(self._update_parser_offset_hint)
+        self.parser_poll_task.currentIndexChanged.connect(self._parser_poll_source_changed)
         self.parser_source.currentIndexChanged.connect(self._update_parser_offset_hint)
         self.parser_offset.valueChanged.connect(self._update_parser_offset_hint)
         self.parser_count.valueChanged.connect(self._update_parser_offset_hint)
         self.parser_byte_lane.currentIndexChanged.connect(self._update_parser_offset_hint)
         self._last_poll_start = self.poll_start.value()
-        self.poll_start.valueChanged.connect(self._sync_parser_register_with_poll)
         self._update_parser_offset_hint()
         add_parser = QPushButton("添加解析结构", objectName="primary")
         add_parser.clicked.connect(self._add_parser)
@@ -1248,7 +1306,8 @@ class MainWindow(QMainWindow):
         self.tx_bytes += len(frame)
         self.tx_metric.setText(f"{self.tx_bytes:,}")
         self._on_frame(frame, "TX")
-        self.write_timeout_timer.start(self.poll_timeout.value())
+        write_timeout = max((task["timeout_ms"] for task in self.poll_tasks), default=500)
+        self.write_timeout_timer.start(write_timeout)
         self.status_label.setText("轮询已暂缓 · 写入命令已发送，等待从站响应")
 
     def _handle_write_response(self, frame: RtuFrame) -> bool:
@@ -1274,7 +1333,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         if self.poll_active and self.worker and self.worker.isRunning():
             self._set_label_text(self.poll_state_value, "运行中")
-            self.poll_next_timer.start(self.poll_interval.value())
+            self._schedule_next_poll_task()
         else:
             self._set_label_text(self.poll_state_value, "已停止")
 
@@ -1376,8 +1435,7 @@ class MainWindow(QMainWindow):
         )
         return page
 
-    def _build_serial_tab(self) -> QWidget:
-        page, layout = self._tab_page()
+    def _add_serial_settings(self, layout: QVBoxLayout) -> None:
         layout.addWidget(QLabel("串口参数", objectName="sectionTitle"))
         layout.addWidget(QLabel("RTU 暂不包含 TCP 设置", objectName="muted"))
         form = QFormLayout()
@@ -1412,12 +1470,27 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         note.setObjectName("muted")
         layout.addWidget(note)
-        return page
 
     def _build_settings_tab(self) -> QWidget:
+        tabs = QTabWidget(objectName="settingsTabs")
+        tabs.setTabPosition(QTabWidget.TabPosition.North)
+        serial_page, serial_layout = self._tab_page()
+        self._add_serial_settings(serial_layout)
+        tabs.addTab(serial_page, "串口参数")
+
         page, layout = self._tab_page()
         layout.addWidget(QLabel("外观设置", objectName="sectionTitle"))
         layout.addWidget(QLabel("默认使用接近 VOFA+ 的清爽明亮配色", objectName="muted"))
+        language_row = QHBoxLayout()
+        language_row.addWidget(QLabel("界面语言"))
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("简体中文", "zh_CN")
+        self.language_combo.addItem("English", "en_US")
+        language_index = self.language_combo.findData(self.settings.value("ui/language", "zh_CN"))
+        self.language_combo.setCurrentIndex(max(0, language_index))
+        self.language_combo.currentIndexChanged.connect(self._language_changed)
+        language_row.addWidget(self.language_combo, 1)
+        layout.addLayout(language_row)
         theme_row = QHBoxLayout()
         theme_row.addWidget(QLabel("界面主题"))
         self.theme_combo = QComboBox()
@@ -1463,17 +1536,26 @@ class MainWindow(QMainWindow):
         project_actions = QHBoxLayout()
         export_project = QPushButton("导出配置 JSON", objectName="primary")
         export_project.clicked.connect(self._export_project_json)
-        import_project = QPushButton("导入配置 JSON")
-        import_project.clicked.connect(self._import_project_json)
         project_actions.addWidget(export_project)
-        project_actions.addWidget(import_project)
         layout.addLayout(project_actions)
         safety_hint = QLabel("导入只恢复配置，不会自动连接串口、开始轮询或发送数据。")
         safety_hint.setWordWrap(True)
         safety_hint.setStyleSheet("color:#209567")
         layout.addWidget(safety_hint)
         layout.addStretch()
-        return page
+        tabs.addTab(page, "软件设置")
+        return tabs
+
+    def _language_changed(self) -> None:
+        language = self.language_combo.currentData() or "zh_CN"
+        self.settings.set("ui/language", language)
+        if language == "en_US":
+            title = "Language"
+            message = "Language saved. Restart Modbus Studio to use the English interface."
+        else:
+            title = "界面语言"
+            message = "语言设置已保存，重新启动 Modbus Studio 后切换为简体中文。"
+        QMessageBox.information(self, title, message)
 
     @staticmethod
     def _set_combo_data(combo: QComboBox, value, field: str) -> None:
@@ -1485,7 +1567,7 @@ class MainWindow(QMainWindow):
     def _project_document(self) -> dict:
         """Capture configuration only; live samples and running state are excluded."""
         view_names = ("frames", "raw", "overview", "waveform", "alarms")
-        tab_names = ("poll", "parse", "write", "builder", "serial", "settings")
+        tab_names = ("poll", "parse", "write", "builder", "settings")
         parser_documents = []
         for config in self.parsers:
             parser_documents.append({
@@ -1493,6 +1575,7 @@ class MainWindow(QMainWindow):
                 "type": config["type"],
                 "order": config["order"],
                 "source": config["source"],
+                "poll_id": config.get("poll_id", self.poll_tasks[0]["id"]),
                 "address": config["address"],
                 "function": config["function"],
                 "register": config["register"],
@@ -1514,18 +1597,25 @@ class MainWindow(QMainWindow):
             "ai_help": {
                 "purpose": "可由人或 AI 编辑的 Modbus Studio 工程配置",
                 "safety": "导入不会自动连接串口、启动轮询、循环发送或写入设备",
+                "poll_blocks": "polls 是独立轮询数据块；parser.poll_id 指定解析来源的数据块 ID",
                 "parser_addressing": "source=data 时 register 是绝对寄存器地址；count 是数值个数，不是寄存器个数",
                 "byte_orders": {"big": "ABCD", "little": "DCBA", "word_swap": "CDAB", "byte_swap": "BADC"},
             },
             "serial": self._serial_config(),
             "poll": {
-                "address": self.poll_address.value(),
-                "function": self.poll_function.currentData(),
-                "start": self.poll_start.value(),
-                "quantity": self.poll_quantity.value(),
-                "interval_ms": self.poll_interval.value(),
-                "timeout_ms": self.poll_timeout.value(),
+                "address": self.poll_tasks[0]["address"],
+                "function": self.poll_tasks[0]["function"],
+                "start": self.poll_tasks[0]["start"],
+                "quantity": self.poll_tasks[0]["quantity"],
+                "interval_ms": self.poll_tasks[0]["interval_ms"],
+                "timeout_ms": self.poll_tasks[0]["timeout_ms"],
             },
+            "polls": [{
+                key: task[key] for key in (
+                    "id", "name", "enabled", "address", "function", "range_mode",
+                    "start", "quantity", "interval_ms", "timeout_ms",
+                )
+            } for task in self.poll_tasks],
             "parsers": parser_documents,
             "alarms": [rule.to_document() for rule in self.alarm_rules],
             "parser_sequence": self._parser_sequence,
@@ -1657,13 +1747,28 @@ class MainWindow(QMainWindow):
         self._set_combo_data(self.stop_bits, serial_config["stopbits"], "serial.stopbits")
         self.settings.save_serial_config(serial_config)
 
-        poll = document["poll"]
-        self.poll_address.setValue(poll["address"])
-        self._set_combo_data(self.poll_function, poll["function"], "poll.function")
-        self.poll_start.setValue(poll["start"])
-        self.poll_quantity.setValue(poll["quantity"])
-        self.poll_interval.setValue(poll["interval_ms"])
-        self.poll_timeout.setValue(poll["timeout_ms"])
+        for row in range(self.frame_model.rowCount() - 1, -1, -1):
+            item = self.frame_model.item(row, 2)
+            slot = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+            if isinstance(slot, str) and ":" in slot:
+                self.frame_model.removeRow(row)
+        saved_polls = document.get("polls")
+        if not saved_polls:
+            legacy = document["poll"]
+            saved_polls = [{
+                "id": "P1", "name": "轮询 1", "enabled": True, "range_mode": "auto", **legacy,
+            }]
+        self.poll_tasks = []
+        self.poll_task_sequence = 0
+        for saved in saved_polls:
+            task = dict(saved)
+            task.update(success=0, failures=0, last_response="—", next_due=0.0)
+            self.poll_tasks.append(task)
+            if task["id"].startswith("P") and task["id"][1:].isdigit():
+                self.poll_task_sequence = max(self.poll_task_sequence, int(task["id"][1:]))
+        self._refresh_poll_task_tree(self.poll_tasks[0]["id"])
+        self._refresh_parser_poll_sources()
+        self._ensure_poll_rows()
 
         receive = document["receive"]
         self.show_timestamp.setChecked(receive["show_timestamp"])
@@ -1674,6 +1779,7 @@ class MainWindow(QMainWindow):
         self._parser_sequence = document.get("parser_sequence", len(document["parsers"]))
         for saved in document["parsers"]:
             config = dict(saved)
+            config["poll_id"] = saved.get("poll_id", self.poll_tasks[0]["id"])
             config["members"] = list(saved["members"])
             config["enabled"] = set(saved["enabled"])
             config["plots"] = set(saved["plots"])
@@ -1720,7 +1826,7 @@ class MainWindow(QMainWindow):
         self._set_combo_data(self.theme_combo, ui["theme"], "ui.theme")
         main_views = {"frames": 0, "raw": 1, "overview": 2, "waveform": 3, "alarms": 4}
         right_tabs = {"receive": 0, "poll": 0, "parse": 1, "write": 2,
-                      "builder": 3, "serial": 4, "settings": 5}
+                      "builder": 3, "serial": 4, "settings": 4}
         self._switch_view(main_views[ui["main_view"]])
         self.right_tabs.setCurrentIndex(right_tabs[ui["right_tab"]])
         self.resize(ui["window_size"]["width"], ui["window_size"]["height"])
@@ -1871,15 +1977,20 @@ class MainWindow(QMainWindow):
         self.bad_metric.setText(f"{self.bad_frames:,}")
         self.status_label.setText("显示已继续 · 等待下一帧数据")
 
-    def _on_frame(self, raw: bytes, direction: str = "RX", poll_slot: str | None = None) -> None:
+    def _on_frame(
+        self, raw: bytes, direction: str = "RX", poll_slot: str | None = None,
+        poll_id: str | None = None,
+    ) -> None:
         frame = RtuFrame(raw, datetime.now(), direction)
-        if direction == "RX" and self.poll_active:
-            expected_function = self.poll_function.currentData()
+        if direction == "RX" and self.poll_active and self.poll_current_task is not None:
+            task = self.poll_current_task
+            expected_function = task["function"]
             if (
-                frame.address == self.poll_address.value()
+                frame.address == task["address"]
                 and frame.function in (expected_function, expected_function | 0x80)
             ):
-                poll_slot = "rx"
+                poll_id = task["id"]
+                poll_slot = f"{poll_id}:rx"
         if self.pause_button.isChecked():
             if frame.crc_ok:
                 self.good_frames += 1
@@ -1887,7 +1998,7 @@ class MainWindow(QMainWindow):
                 self.bad_frames += 1
             if direction == "RX":
                 if frame.crc_ok:
-                    self._parse_frame_channels(frame, update_display=False)
+                    self._parse_frame_channels(frame, update_display=False, poll_id=poll_id)
                 if not self._handle_write_response(frame):
                     self._handle_poll_response(frame)
             return
@@ -1910,6 +2021,7 @@ class MainWindow(QMainWindow):
         if not self.uppercase_hex.isChecked():
             raw_hex = raw_hex.lower()
         row = [
+            QStandardItem(poll_id or "—"),
             QStandardItem(stamp),
             QStandardItem(direction),
             QStandardItem(address),
@@ -1918,15 +2030,15 @@ class MainWindow(QMainWindow):
             QStandardItem(crc_label),
             QStandardItem(raw_hex),
         ]
-        row[2].setData(frame.address, Qt.ItemDataRole.UserRole)
-        row[3].setData(frame.function, Qt.ItemDataRole.UserRole)
-        row[5].setData(frame.crc_ok, Qt.ItemDataRole.UserRole)
-        row[0].setData(frame, Qt.ItemDataRole.UserRole)
+        row[3].setData(frame.address, Qt.ItemDataRole.UserRole)
+        row[4].setData(frame.function, Qt.ItemDataRole.UserRole)
+        row[6].setData(frame.crc_ok, Qt.ItemDataRole.UserRole)
+        row[1].setData(frame, Qt.ItemDataRole.UserRole)
         if poll_slot:
-            row[1].setData(poll_slot, Qt.ItemDataRole.UserRole + 1)
+            row[2].setData(poll_slot, Qt.ItemDataRole.UserRole + 1)
         color = QColor("#48d9c2" if direction == "RX" else "#68a7ff")
-        row[1].setForeground(color)
-        row[5].setForeground(QColor("#68df95" if frame.crc_ok else "#ff7185"))
+        row[2].setForeground(color)
+        row[6].setForeground(QColor("#68df95" if frame.crc_ok else "#ff7185"))
         stable_row = self._find_poll_row(poll_slot) if poll_slot else -1
         if stable_row >= 0:
             # Keep the model items alive and update them in place. Replacing all seven
@@ -1955,7 +2067,7 @@ class MainWindow(QMainWindow):
 
         self._raw_pending.append(f"{stamp}  {direction:<2}  {raw_hex}")
         if direction == "RX" and frame.crc_ok:
-            self._parse_frame_channels(frame)
+            self._parse_frame_channels(frame, poll_id=poll_id)
         if direction == "RX":
             if not self._handle_write_response(frame):
                 self._handle_poll_response(frame)
@@ -1990,33 +2102,38 @@ class MainWindow(QMainWindow):
         if not slot:
             return -1
         for row in range(self.frame_model.rowCount()):
-            item = self.frame_model.item(row, 1)
+            item = self.frame_model.item(row, 2)
             if item and item.data(Qt.ItemDataRole.UserRole + 1) == slot:
                 return row
         return -1
 
     def _ensure_poll_rows(self) -> None:
-        for slot, direction, summary in (
-            ("rx", "RX", "等待首个响应"),
-            ("tx", "TX", "等待发送请求"),
-        ):
-            if self._find_poll_row(slot) >= 0:
-                continue
-            items = [
-                QStandardItem("—"), QStandardItem(direction), QStandardItem("—"),
-                QStandardItem("轮询"), QStandardItem(summary), QStandardItem("—"),
-                QStandardItem("—"),
-            ]
-            items[1].setData(slot, Qt.ItemDataRole.UserRole + 1)
-            items[1].setForeground(QColor("#48d9c2" if direction == "RX" else "#68a7ff"))
-            self.frame_model.appendRow(items)
+        if not hasattr(self, "frame_model"):
+            return
+        for task in self.poll_tasks:
+            for suffix, direction, summary in (
+                ("tx", "TX", "等待发送请求"),
+                ("rx", "RX", "等待首个响应"),
+            ):
+                slot = f"{task['id']}:{suffix}"
+                if self._find_poll_row(slot) >= 0:
+                    continue
+                items = [
+                    QStandardItem(task["id"]), QStandardItem("—"), QStandardItem(direction),
+                    QStandardItem(str(task["address"])), QStandardItem("轮询"),
+                    QStandardItem(summary), QStandardItem("—"), QStandardItem("—"),
+                ]
+                items[2].setData(slot, Qt.ItemDataRole.UserRole + 1)
+                items[2].setForeground(QColor("#48d9c2" if direction == "RX" else "#68a7ff"))
+                self.frame_model.appendRow(items)
 
     def _trim_frame_rows(self) -> None:
         while self.frame_model.rowCount() > self.keep_limit.value():
             removable = -1
             for row in range(self.frame_model.rowCount()):
-                item = self.frame_model.item(row, 1)
-                if not item or item.data(Qt.ItemDataRole.UserRole + 1) not in ("rx", "tx"):
+                item = self.frame_model.item(row, 2)
+                slot = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+                if not isinstance(slot, str) or ":" not in slot:
                     removable = row
                     break
             if removable < 0:
@@ -2028,11 +2145,18 @@ class MainWindow(QMainWindow):
         if not indexes:
             return
         source_index = self.frame_filter.mapToSource(indexes[0])
-        frame = self.frame_model.item(source_index.row(), 0).data(Qt.ItemDataRole.UserRole)
+        frame = self.frame_model.item(source_index.row(), 1).data(Qt.ItemDataRole.UserRole)
+        poll_id = self.frame_model.item(source_index.row(), 0).text()
         if not isinstance(frame, RtuFrame):
+            direction = self.frame_model.item(source_index.row(), 2).text()
+            summary = self.frame_model.item(source_index.row(), 5).text()
+            self.detail_text.setPlainText(
+                f"轮询项   {poll_id}\n方向     {direction}\n状态     {summary}\n\n当前行尚无完整帧。"
+            )
             return
         crc_received = int.from_bytes(frame.raw[-2:], "little") if len(frame.raw) >= 2 else 0
         lines = [
+            f"轮询项   {poll_id}",
             f"时间     {frame.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}",
             f"方向     {frame.direction}",
             f"从站     {frame.address if frame.address is not None else '—'}",
@@ -2065,6 +2189,198 @@ class MainWindow(QMainWindow):
         self.frame_filter.keyword = ""
         self.frame_filter.invalidateFilter()
 
+    def _task_by_id(self, task_id: str | None) -> dict | None:
+        return next((task for task in self.poll_tasks if task["id"] == task_id), None)
+
+    def _selected_poll_task(self) -> dict | None:
+        item = self.poll_task_tree.currentItem() if hasattr(self, "poll_task_tree") else None
+        return self._task_by_id(item.data(0, Qt.ItemDataRole.UserRole) if item else None)
+
+    def _create_poll_task(self, source: dict | None = None, select: bool = True) -> dict:
+        used_numbers = {
+            int(task["id"][1:]) for task in self.poll_tasks
+            if task["id"].startswith("P") and task["id"][1:].isdigit()
+        }
+        task_number = 1
+        while task_number in used_numbers:
+            task_number += 1
+        self.poll_task_sequence = max(self.poll_task_sequence, task_number)
+        task_id = f"P{task_number}"
+        if source is None:
+            task = {
+                "id": task_id, "name": f"轮询 {task_number}", "enabled": True,
+                "address": self.poll_address.value(), "function": self.poll_function.currentData(),
+                "range_mode": "auto", "start": self.poll_start.value(),
+                "quantity": self.poll_quantity.value(), "interval_ms": self.poll_interval.value(),
+                "timeout_ms": self.poll_timeout.value(), "success": 0, "failures": 0,
+                "last_response": "—", "next_due": 0.0,
+            }
+        else:
+            task = dict(source)
+            task.update({
+                "id": task_id, "name": f"{source['name']} 副本", "success": 0,
+                "failures": 0, "last_response": "—", "next_due": 0.0,
+            })
+        self.poll_tasks.append(task)
+        self._refresh_poll_task_tree(task_id if select else None)
+        self._refresh_parser_poll_sources()
+        self._ensure_poll_rows()
+        return task
+
+    def _refresh_poll_task_tree(self, select_id: str | None = None) -> None:
+        if not hasattr(self, "poll_task_tree"):
+            return
+        if select_id is None:
+            selected = self._selected_poll_task()
+            select_id = selected["id"] if selected else None
+        self.poll_task_tree.blockSignals(True)
+        self.poll_task_tree.clear()
+        selected_item = None
+        for task in self.poll_tasks:
+            end = task["start"] + task["quantity"] - 1
+            item = QTreeWidgetItem([task["id"], task["name"], f"R{task['start']}～R{end}"])
+            item.setData(0, Qt.ItemDataRole.UserRole, task["id"])
+            if not task["enabled"]:
+                for column in range(3):
+                    item.setForeground(column, QColor("#8793a5"))
+            self.poll_task_tree.addTopLevelItem(item)
+            if task["id"] == select_id:
+                selected_item = item
+        self.poll_task_tree.blockSignals(False)
+        if selected_item is None and self.poll_task_tree.topLevelItemCount():
+            selected_item = self.poll_task_tree.topLevelItem(0)
+        if selected_item is not None:
+            self.poll_task_tree.setCurrentItem(selected_item)
+            self._load_poll_task(self._task_by_id(selected_item.data(0, Qt.ItemDataRole.UserRole)))
+
+    def _load_poll_task(self, task: dict | None) -> None:
+        if task is None:
+            return
+        self._poll_form_loading = True
+        try:
+            self.poll_name.setText(task["name"])
+            self.poll_enabled.setChecked(task["enabled"])
+            self.poll_address.setValue(task["address"])
+            self._set_combo_data(self.poll_function, task["function"], "poll.function")
+            self._set_combo_data(self.poll_range_mode, task["range_mode"], "poll.range_mode")
+            self.poll_start.setValue(task["start"])
+            self.poll_quantity.setValue(task["quantity"])
+            self.poll_interval.setValue(task["interval_ms"])
+            self.poll_timeout.setValue(task["timeout_ms"])
+            self._set_label_text(self.poll_success_value, str(task["success"]))
+            self._set_label_text(self.poll_failure_value, str(task["failures"]))
+            self._set_label_text(self.poll_response_value, task["last_response"])
+            self._update_poll_range_display()
+        finally:
+            self._poll_form_loading = False
+
+    def _poll_task_selected(self, current: QTreeWidgetItem | None, _previous=None) -> None:
+        task_id = current.data(0, Qt.ItemDataRole.UserRole) if current else None
+        self._load_poll_task(self._task_by_id(task_id))
+
+    def _poll_form_changed(self, *_args) -> None:
+        if self._poll_form_loading:
+            return
+        task = self._selected_poll_task()
+        if task is None:
+            return
+        task.update({
+            "name": self.poll_name.text().strip() or task["id"],
+            "enabled": self.poll_enabled.isChecked(),
+            "address": self.poll_address.value(), "function": self.poll_function.currentData(),
+            "range_mode": self.poll_range_mode.currentData(), "start": self.poll_start.value(),
+            "quantity": self.poll_quantity.value(), "interval_ms": self.poll_interval.value(),
+            "timeout_ms": self.poll_timeout.value(),
+        })
+        self._update_poll_task_item(task)
+        self._refresh_parser_poll_sources()
+        if (
+            hasattr(self, "parser_poll_task")
+            and self.parser_poll_task.currentData() == task["id"]
+            and self.parser_source.currentData() == "data"
+        ):
+            self.parser_offset.setValue(task["start"])
+
+    def _update_poll_task_item(self, task: dict) -> None:
+        for index in range(self.poll_task_tree.topLevelItemCount()):
+            item = self.poll_task_tree.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) != task["id"]:
+                continue
+            end = task["start"] + task["quantity"] - 1
+            item.setText(1, task["name"])
+            item.setText(2, f"R{task['start']}～R{end}")
+            color = QColor() if task["enabled"] else QColor("#8793a5")
+            for column in range(3):
+                item.setForeground(column, color)
+            break
+
+    def _add_poll_task(self) -> None:
+        if not self.poll_active:
+            self._create_poll_task()
+
+    def _copy_poll_task(self) -> None:
+        task = self._selected_poll_task()
+        if task is not None and not self.poll_active:
+            self._create_poll_task(task)
+
+    def _delete_poll_task(self) -> None:
+        task = self._selected_poll_task()
+        if task is None or self.poll_active:
+            return
+        if len(self.poll_tasks) == 1:
+            QMessageBox.information(self, "保留轮询项", "至少需要保留一个轮询项。")
+            return
+        if any(config.get("poll_id") == task["id"] for config in self.parsers):
+            QMessageBox.information(self, "轮询项正在使用", "请先删除或改绑使用此数据块的解析通道。")
+            return
+        self.poll_tasks.remove(task)
+        for row in range(self.frame_model.rowCount() - 1, -1, -1):
+            item = self.frame_model.item(row, 0)
+            if item and item.text() == task["id"]:
+                self.frame_model.removeRow(row)
+        self._refresh_poll_task_tree()
+        self._refresh_parser_poll_sources()
+
+    def _refresh_parser_poll_sources(self) -> None:
+        if not hasattr(self, "parser_poll_task"):
+            return
+        current = self.parser_poll_task.currentData()
+        self.parser_poll_task.blockSignals(True)
+        self.parser_poll_task.clear()
+        for task in self.poll_tasks:
+            end = task["start"] + task["quantity"] - 1
+            self.parser_poll_task.addItem(
+                f"{task['id']} · {task['name']} · 从站{task['address']} · R{task['start']}～R{end}",
+                task["id"],
+            )
+        index = self.parser_poll_task.findData(current)
+        self.parser_poll_task.setCurrentIndex(index if index >= 0 else 0)
+        self.parser_poll_task.blockSignals(False)
+
+    def _parser_poll_source_changed(self, *_args) -> None:
+        task = self._task_by_id(self.parser_poll_task.currentData())
+        if task is not None:
+            self.parser_address.setValue(task["address"])
+            self._set_combo_data(self.parser_function, task["function"], "parser.function")
+            self.parser_offset.setValue(task["start"])
+        self._update_parser_offset_hint()
+
+    def _run_selected_poll_once(self) -> None:
+        task = self._selected_poll_task()
+        if task is None or self.poll_waiting or self.write_in_progress:
+            return
+        if not self.worker or not self.worker.isRunning():
+            QMessageBox.information(self, "尚未连接", "请先连接串口，再执行轮询项。")
+            return
+        task["next_due"] = 0.0
+        if self.poll_active:
+            self.poll_next_timer.stop()
+            self._send_poll_request(preferred_task=task)
+            return
+        self.poll_manual_once = True
+        self.poll_active = True
+        self._send_poll_request(preferred_task=task)
+
     def _toggle_polling(self) -> None:
         if self.poll_active:
             self._stop_polling()
@@ -2072,20 +2388,26 @@ class MainWindow(QMainWindow):
         if not self.worker or not self.worker.isRunning():
             QMessageBox.information(self, "尚未连接", "请先连接串口，再启动寄存器轮询。")
             return
+        self._poll_form_changed()
+        enabled = [task for task in self.poll_tasks if task["enabled"]]
+        if not enabled:
+            QMessageBox.information(self, "没有启用项", "请至少启用一个轮询项。")
+            return
         try:
-            self.poll_request = build_request(
-                self.poll_address.value(),
-                self.poll_function.currentData(),
-                self.poll_start.value(),
-                self.poll_quantity.value(),
-            )
+            for task in enabled:
+                build_request(task["address"], task["function"], task["start"], task["quantity"])
         except ValueError as exc:
             QMessageBox.information(self, "轮询参数无效", str(exc))
             return
         self.poll_active = True
+        self.poll_manual_once = False
         self.poll_waiting = False
+        self.poll_current_task = None
         self.poll_success = 0
         self.poll_failures = 0
+        now = time.monotonic()
+        for task in self.poll_tasks:
+            task.update(success=0, failures=0, last_response="等待", next_due=now)
         self._set_label_text(self.poll_state_value, "运行中")
         self._set_label_text(self.poll_success_value, "0")
         self._set_label_text(self.poll_failure_value, "0")
@@ -2093,8 +2415,10 @@ class MainWindow(QMainWindow):
         self._update_poll_range_display()
         self.repeat_send.setChecked(False)
         self._ensure_poll_rows()
-        for widget in (self.poll_address, self.poll_function, self.poll_start, self.poll_quantity):
+        for widget in self._poll_editor_widgets():
             widget.setEnabled(False)
+        for button in (self.poll_add_button, self.poll_copy_button, self.poll_delete_button, self.poll_once_button):
+            button.setEnabled(False)
         self.poll_button.setText("停止轮询")
         self.poll_button.setObjectName("danger")
         self.poll_button.style().unpolish(self.poll_button)
@@ -2104,7 +2428,9 @@ class MainWindow(QMainWindow):
     def _stop_polling(self, silent: bool = False) -> None:
         was_active = self.poll_active
         self.poll_active = False
+        self.poll_manual_once = False
         self.poll_waiting = False
+        self.poll_current_task = None
         if hasattr(self, "poll_next_timer"):
             self.poll_next_timer.stop()
             self.poll_timeout_timer.stop()
@@ -2113,8 +2439,10 @@ class MainWindow(QMainWindow):
             self.poll_button.setObjectName("primary")
             self.poll_button.style().unpolish(self.poll_button)
             self.poll_button.style().polish(self.poll_button)
-            for widget in (self.poll_address, self.poll_function, self.poll_start, self.poll_quantity):
+            for widget in self._poll_editor_widgets():
                 widget.setEnabled(True)
+            for button in (self.poll_add_button, self.poll_copy_button, self.poll_delete_button, self.poll_once_button):
+                button.setEnabled(True)
         cancelled_write = self._queued_write_frame is not None and not self.write_in_progress
         if cancelled_write:
             self._reset_write_transaction()
@@ -2127,11 +2455,31 @@ class MainWindow(QMainWindow):
             self._set_label_text(self.poll_state_value, "已停止")
 
     def _update_poll_range_display(self) -> None:
-        start = self.poll_start.value()
-        end = start + self.poll_quantity.value() - 1
+        task = self._selected_poll_task()
+        start = task["start"] if task else self.poll_start.value()
+        quantity = task["quantity"] if task else self.poll_quantity.value()
+        end = start + quantity - 1
         self._set_label_text(self.poll_range_value, f"R{start}～R{end}")
 
-    def _send_poll_request(self) -> None:
+    def _poll_editor_widgets(self) -> tuple[QWidget, ...]:
+        return (
+            self.poll_name, self.poll_enabled, self.poll_address, self.poll_function,
+            self.poll_range_mode, self.poll_start, self.poll_quantity,
+            self.poll_interval, self.poll_timeout,
+        )
+
+    def _schedule_next_poll_task(self) -> None:
+        if not self.poll_active or self.poll_waiting or self.write_in_progress:
+            return
+        enabled = [task for task in self.poll_tasks if task["enabled"]]
+        if not enabled:
+            self._stop_polling()
+            return
+        task = min(enabled, key=lambda item: (item["next_due"], self.poll_tasks.index(item)))
+        delay_ms = max(0, round((task["next_due"] - time.monotonic()) * 1000))
+        self.poll_next_timer.start(delay_ms)
+
+    def _send_poll_request(self, preferred_task: dict | None = None) -> None:
         if (
             not self.poll_active
             or self.poll_waiting
@@ -2142,14 +2490,20 @@ class MainWindow(QMainWindow):
         if not self.worker or not self.worker.isRunning():
             self._stop_polling(silent=True)
             return
+        enabled = [task for task in self.poll_tasks if task["enabled"]]
+        if preferred_task is not None:
+            task = preferred_task
+        elif enabled:
+            task = min(enabled, key=lambda item: (item["next_due"], self.poll_tasks.index(item)))
+            if task["next_due"] > time.monotonic():
+                self._schedule_next_poll_task()
+                return
+        else:
+            self._stop_polling()
+            return
         try:
-            # Rebuild for every cycle so parser-created range expansions take effect
-            # on the next request without interrupting an active polling session.
             self.poll_request = build_request(
-                self.poll_address.value(),
-                self.poll_function.currentData(),
-                self.poll_start.value(),
-                self.poll_quantity.value(),
+                task["address"], task["function"], task["start"], task["quantity"],
             )
             self.worker.send(self.poll_request)
         except serial.SerialException as exc:
@@ -2158,18 +2512,43 @@ class MainWindow(QMainWindow):
             return
         self.tx_bytes += len(self.poll_request)
         self.tx_metric.setText(f"{self.tx_bytes:,}")
-        self._on_frame(self.poll_request, "TX", poll_slot="tx")
+        self.poll_current_task = task
+        self._on_frame(
+            self.poll_request, "TX", poll_slot=f"{task['id']}:tx", poll_id=task["id"]
+        )
         self.poll_waiting = True
-        self.poll_sent_quantity = self.poll_quantity.value()
+        self.poll_sent_quantity = task["quantity"]
         self.poll_sent_at = time.perf_counter()
-        self.poll_timeout_timer.start(self.poll_timeout.value())
-        self._update_poll_range_display()
+        self.poll_timeout_timer.start(task["timeout_ms"])
+        task["last_response"] = "等待响应"
+
+    def _set_poll_rx_waiting(self, task: dict, text: str = "等待响应") -> None:
+        row = self._find_poll_row(f"{task['id']}:rx")
+        if row < 0:
+            self._ensure_poll_rows()
+            row = self._find_poll_row(f"{task['id']}:rx")
+        if row < 0:
+            return
+        self.frame_table.setUpdatesEnabled(False)
+        try:
+            for column, value in ((1, "—"), (3, str(task["address"])), (4, "轮询"),
+                                  (5, text), (6, "—"), (7, "—")):
+                item = self.frame_model.item(row, column)
+                if item is not None:
+                    item.setText(value)
+            time_item = self.frame_model.item(row, 1)
+            if time_item is not None:
+                time_item.setData(None, Qt.ItemDataRole.UserRole)
+        finally:
+            self.frame_table.setUpdatesEnabled(True)
+            self.frame_table.viewport().update()
 
     def _handle_poll_response(self, frame: RtuFrame) -> None:
-        if not self.poll_active or not self.poll_waiting:
+        task = self.poll_current_task
+        if not self.poll_active or not self.poll_waiting or task is None:
             return
-        expected_address = self.poll_address.value()
-        expected_function = self.poll_function.currentData()
+        expected_address = task["address"]
+        expected_function = task["function"]
         if frame.address != expected_address or frame.function not in (expected_function, expected_function | 0x80):
             return
         self.poll_timeout_timer.stop()
@@ -2183,29 +2562,47 @@ class MainWindow(QMainWindow):
         expected_length = data_bytes + 5
         if frame.crc_ok and frame.function == expected_function and len(frame.raw) == expected_length:
             self.poll_success += 1
+            task["success"] += 1
             response = f"{elapsed_ms:.1f} ms"
         else:
             self.poll_failures += 1
+            task["failures"] += 1
             response = "异常"
-        self._set_label_text(self.poll_success_value, str(self.poll_success))
-        self._set_label_text(self.poll_failure_value, str(self.poll_failures))
-        self._set_label_text(self.poll_response_value, response)
+        task["last_response"] = response
+        task["next_due"] = time.monotonic() + task["interval_ms"] / 1000
+        if self._selected_poll_task() is task:
+            self._set_label_text(self.poll_success_value, str(task["success"]))
+            self._set_label_text(self.poll_failure_value, str(task["failures"]))
+            self._set_label_text(self.poll_response_value, response)
         self._continue_after_poll_cycle()
 
     def _poll_timed_out(self) -> None:
-        if not self.poll_active or not self.poll_waiting:
+        task = self.poll_current_task
+        if not self.poll_active or not self.poll_waiting or task is None:
             return
         self.poll_waiting = False
         self.poll_failures += 1
-        self._set_label_text(self.poll_failure_value, str(self.poll_failures))
-        self._set_label_text(self.poll_response_value, "超时")
+        task["failures"] += 1
+        task["last_response"] = "超时"
+        task["next_due"] = time.monotonic() + task["interval_ms"] / 1000
+        self._set_poll_rx_waiting(task, "超时")
+        if self._selected_poll_task() is task:
+            self._set_label_text(self.poll_success_value, str(task["success"]))
+            self._set_label_text(self.poll_failure_value, str(task["failures"]))
+            self._set_label_text(self.poll_response_value, "超时")
         self._continue_after_poll_cycle()
 
     def _continue_after_poll_cycle(self) -> None:
+        self.poll_current_task = None
+        if self.poll_manual_once:
+            self.poll_manual_once = False
+            self.poll_active = False
+            self._set_label_text(self.poll_state_value, "单次完成")
+            return
         if self._queued_write_frame is not None:
             self._send_queued_write()
         elif self.poll_active:
-            self.poll_next_timer.start(self.poll_interval.value())
+            self._schedule_next_poll_task()
 
     def _poll_function_changed(self) -> None:
         function = self.poll_function.currentData()
@@ -2220,25 +2617,40 @@ class MainWindow(QMainWindow):
         self.parser_byte_lane.setEnabled(is_8bit and data_source)
         self.parser_form.setRowVisible(self.parser_byte_lane, is_8bit and data_source)
         if self.parser_source.currentData() == "data":
+            task = self._task_by_id(self.parser_poll_task.currentData())
+            poll_start = task["start"] if task else self.poll_start.value()
+            poll_end = poll_start + (task["quantity"] if task else self.poll_quantity.value()) - 1
+            if self.parser_offset.value() != poll_start:
+                self.parser_offset.blockSignals(True)
+                self.parser_offset.setValue(poll_start)
+                self.parser_offset.blockSignals(False)
+            self.parser_offset.setReadOnly(True)
+            self.parser_offset.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            self.parser_offset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.parser_offset.setToolTip("起始寄存器由所选数据块 ID 自动确定")
             register_step = max(1, (size + 1) // 2)
             self.parser_offset.setSingleStep(register_step)
             first_register = self.parser_offset.value()
             lane = self.parser_byte_lane.currentData() if is_8bit else 0
             total_bytes = size * self.parser_count.value()
             last_register = first_register + (lane + total_bytes - 1) // 2
-            internal_offset = (first_register - self.poll_start.value()) * 2 + lane
-            self.parser_offset_label.setText("起始寄存器")
+            internal_offset = (first_register - poll_start) * 2 + lane
+            self.parser_offset_label.setText("数据块起点")
             location = (
                 f"R{first_register}" if last_register == first_register
                 else f"R{first_register}～R{last_register}"
             )
-            validity = "" if internal_offset >= 0 else "；注意：该地址小于当前轮询起点"
+            validity = "" if poll_start <= first_register and last_register <= poll_end else "；注意：当前地址超出数据块范围"
             self.parser_offset_hint.setText(
                 f"将解析 {location}；解析数量表示数值个数。"
                 f"{self.parser_type.currentText()} 每个占 {register_step} 个寄存器，"
                 f"轮询范围会自动补足{validity}。"
             )
         else:
+            self.parser_offset.setReadOnly(False)
+            self.parser_offset.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            self.parser_offset.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self.parser_offset.setToolTip("完整 RTU 帧中的字节偏移")
             self.parser_offset.setSingleStep(size)
             start = self.parser_offset.value()
             end = start + size * self.parser_count.value() - 1
@@ -2273,6 +2685,7 @@ class MainWindow(QMainWindow):
             "type": self.parser_type.currentText(),
             "order": self.parser_order.currentData(),
             "source": self.parser_source.currentData(),
+            "poll_id": self.parser_poll_task.currentData(),
             "address": self.parser_address.value(),
             "function": self.parser_function.currentData(),
             "register": self.parser_offset.value(),
@@ -2295,23 +2708,32 @@ class MainWindow(QMainWindow):
 
     def _expand_poll_range_for_parser(self, config: dict) -> str:
         """Ensure a register poll includes every byte needed by a new parser."""
-        if config["source"] != "data" or self.poll_function.currentData() not in (3, 4):
+        task = self._task_by_id(config.get("poll_id"))
+        if config["source"] != "data" or task is None or task["function"] not in (3, 4):
             return ""
         size = type_size(config["type"])
         lane = config.get("byte_lane", 0) if size == 1 else 0
         parser_start = config["register"]
-        poll_start = self.poll_start.value()
-        if parser_start < poll_start:
-            return "；地址小于当前轮询起点，请调整轮询范围"
+        poll_start = task["start"]
         required_end = parser_start + (lane + size * config["count"] + 1) // 2
-        required_quantity = required_end - poll_start
-        if required_quantity <= self.poll_quantity.value():
+        poll_end = poll_start + task["quantity"]
+        if poll_start <= parser_start and required_end <= poll_end:
             return ""
+        if task["range_mode"] == "manual":
+            return f"；地址超出 {task['id']} 的手动范围"
+        new_start = min(poll_start, parser_start)
+        new_end = max(poll_end, required_end)
+        required_quantity = new_end - new_start
         if required_quantity > 125:
             return f"；需要读取 {required_quantity} 个寄存器，超过单帧上限125"
-        self.poll_quantity.setValue(required_quantity)
+        task["start"] = new_start
+        task["quantity"] = required_quantity
+        if self._selected_poll_task() is task:
+            self._load_poll_task(task)
+        self._refresh_poll_task_tree(task["id"])
+        self._refresh_parser_poll_sources()
         suffix = "，下一轮生效" if self.poll_active else ""
-        return f"；轮询数量已自动扩大为 {required_quantity}{suffix}"
+        return f"；{task['id']} 已自动调整为 R{new_start}～R{new_end - 1}{suffix}"
 
     def _insert_parser(self, config: dict) -> None:
         saved_views = config.get("plot_views")
@@ -2354,7 +2776,8 @@ class MainWindow(QMainWindow):
         register = config["register"] + byte_index // 2
         lane = ".H" if byte_index % 2 == 0 else ".L"
         suffix = lane if size == 1 else ""
-        return f"R{register}{suffix} · {config['type']}"
+        poll_prefix = f"{config.get('poll_id', '—')} · "
+        return f"{poll_prefix}R{register}{suffix} · {config['type']}"
 
     def _parser_for_item(self, item: QTreeWidgetItem | None) -> tuple[dict | None, int]:
         if item is None:
@@ -2521,9 +2944,13 @@ class MainWindow(QMainWindow):
         self.alarm_rules = [rule for rule in self.alarm_rules if rule.channel not in channels]
         self._rebuild_alarm_rule_table()
 
-    def _parse_frame_channels(self, frame: RtuFrame, update_display: bool = True) -> None:
+    def _parse_frame_channels(
+        self, frame: RtuFrame, update_display: bool = True, poll_id: str | None = None,
+    ) -> None:
         waveform_values: dict[str, float | int] = {}
         for config in self.parsers:
+            if config["source"] == "data" and config.get("poll_id") and config["poll_id"] != poll_id:
+                continue
             if config["address"] and frame.address != config["address"]:
                 continue
             if config["function"] >= 0 and frame.function != config["function"]:
@@ -2531,8 +2958,11 @@ class MainWindow(QMainWindow):
             source = frame.raw if config["source"] == "frame" else modbus_data_area(frame.raw)
             offset = config["offset"]
             if config["source"] == "data":
+                task = self._task_by_id(config.get("poll_id"))
+                if task is None:
+                    continue
                 lane = config.get("byte_lane", 0) if type_size(config["type"]) == 1 else 0
-                offset = (config["register"] - self.poll_start.value()) * 2 + lane
+                offset = (config["register"] - task["start"]) * 2 + lane
             try:
                 values = parse_typed_values(
                     source,

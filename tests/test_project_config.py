@@ -91,6 +91,23 @@ def test_project_validation_accepts_two_wave_views():
     assert result["ui"]["wave_layout"] == 1
 
 
+def test_project_validation_accepts_multiple_poll_blocks_and_parser_binding():
+    document = sample_project()
+    document["polls"] = [
+        {"id": "P1", "name": "电压区", "enabled": True, "address": 1,
+         "function": 3, "range_mode": "auto", "start": 1103, "quantity": 12,
+         "interval_ms": 50, "timeout_ms": 500},
+        {"id": "P2", "name": "温度区", "enabled": True, "address": 2,
+         "function": 4, "range_mode": "manual", "start": 200, "quantity": 8,
+         "interval_ms": 200, "timeout_ms": 600},
+    ]
+    document["parsers"][0]["poll_id"] = "P1"
+    assert validate_project(document)["parsers"][0]["poll_id"] == "P1"
+    document["parsers"][0]["poll_id"] = "P9"
+    with pytest.raises(ValueError, match="poll_id"):
+        validate_project(document)
+
+
 def test_project_validation_rejects_inconsistent_wave_view_bindings():
     document = sample_project()
     document["parsers"][0]["plot_views"] = [[], []]

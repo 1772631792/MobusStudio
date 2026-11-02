@@ -65,6 +65,31 @@ def validate_project(document: object) -> dict:
     _integer(poll.get("interval_ms"), "poll.interval_ms", 0, 60000)
     _integer(poll.get("timeout_ms"), "poll.timeout_ms", 50, 10000)
 
+    poll_ids: set[str] = set()
+    polls = root.get("polls", [])
+    if not isinstance(polls, list) or len(polls) > 64:
+        raise ValueError("polls 必须是最多 64 项的数组")
+    for pos, saved_poll in enumerate(polls):
+        path = f"polls[{pos}]"
+        saved_poll = _mapping(saved_poll, path)
+        poll_id = saved_poll.get("id")
+        if not isinstance(poll_id, str) or not poll_id or len(poll_id) > 32:
+            raise ValueError(f"{path}.id 必须是非空字符串")
+        if poll_id in poll_ids:
+            raise ValueError(f"{path}.id 不能重复")
+        poll_ids.add(poll_id)
+        if not isinstance(saved_poll.get("name"), str) or not saved_poll["name"].strip():
+            raise ValueError(f"{path}.name 必须是非空字符串")
+        if not isinstance(saved_poll.get("enabled"), bool):
+            raise ValueError(f"{path}.enabled 必须是 true 或 false")
+        _choice(saved_poll.get("range_mode"), f"{path}.range_mode", {"auto", "manual"})
+        _integer(saved_poll.get("address"), f"{path}.address", 1, 247)
+        poll_function = _choice(saved_poll.get("function"), f"{path}.function", {1, 2, 3, 4})
+        _integer(saved_poll.get("start"), f"{path}.start", 0, 65535)
+        _integer(saved_poll.get("quantity"), f"{path}.quantity", 1, 2000 if poll_function in (1, 2) else 125)
+        _integer(saved_poll.get("interval_ms"), f"{path}.interval_ms", 0, 60000)
+        _integer(saved_poll.get("timeout_ms"), f"{path}.timeout_ms", 50, 10000)
+
     parsers = root.get("parsers")
     if not isinstance(parsers, list) or len(parsers) > 512:
         raise ValueError("parsers 必须是最多 512 项的数组")
@@ -78,6 +103,9 @@ def validate_project(document: object) -> dict:
         data_type = _choice(parser.get("type"), f"{path}.type", DATA_TYPES)
         _choice(parser.get("order"), f"{path}.order", BYTE_ORDERS)
         source = _choice(parser.get("source"), f"{path}.source", SOURCES)
+        parser_poll_id = parser.get("poll_id")
+        if parser_poll_id is not None and (not isinstance(parser_poll_id, str) or (poll_ids and parser_poll_id not in poll_ids)):
+            raise ValueError(f"{path}.poll_id 必须引用现有轮询项")
         _integer(parser.get("address"), f"{path}.address", 0, 247)
         _choice(parser.get("function"), f"{path}.function", {-1, 1, 2, 3, 4, 5, 6, 15, 16})
         _integer(parser.get("register"), f"{path}.register", 0, 65535)
