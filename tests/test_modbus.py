@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime
 
 from modbus_tool.core.data_parser import encode_typed_values, modbus_data_area, parse_typed_values
 from modbus_tool.core.modbus import (
@@ -7,6 +8,7 @@ from modbus_tool.core.modbus import (
     check_crc,
     crc16,
     parse_hex,
+    RtuFrame,
     write_response_status,
 )
 
@@ -16,6 +18,16 @@ def test_known_crc_vector():
     assert crc16(payload) == 0xCDC5
     assert append_crc(payload).hex(" ").upper() == "01 03 00 00 00 0A C5 CD"
     assert check_crc(append_crc(payload))
+
+
+def test_frame_has_complete_english_labels() -> None:
+    frame = RtuFrame(
+        append_crc(bytes.fromhex("01 03 04 00 64 00 C8")),
+        datetime.now(),
+        "RX",
+    )
+    assert frame.localized_function_name(True) == "Read Holding Registers"
+    assert frame.localized_summary(True) == "2 registers · 100, 200"
 
 
 def test_build_read_holding_registers():

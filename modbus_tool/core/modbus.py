@@ -17,6 +17,17 @@ FUNCTION_NAMES = {
     16: "写多个寄存器",
 }
 
+FUNCTION_NAMES_EN = {
+    1: "Read Coils",
+    2: "Read Discrete Inputs",
+    3: "Read Holding Registers",
+    4: "Read Input Registers",
+    5: "Write Single Coil",
+    6: "Write Single Register",
+    15: "Write Multiple Coils",
+    16: "Write Multiple Registers",
+}
+
 
 def crc16(data: bytes) -> int:
     """Return Modbus CRC16 as an integer (wire order is low byte first)."""
@@ -103,6 +114,15 @@ class RtuFrame:
             return "异常响应"
         return FUNCTION_NAMES.get(self.function, f"自定义 0x{self.function:02X}")
 
+    def localized_function_name(self, english: bool = False) -> str:
+        if not english:
+            return self.function_name
+        if self.function is None:
+            return "Insufficient data"
+        if self.function & 0x80:
+            return "Exception Response"
+        return FUNCTION_NAMES_EN.get(self.function, f"Custom 0x{self.function:02X}")
+
     @property
     def summary(self) -> str:
         if len(self.raw) < 2:
@@ -127,6 +147,32 @@ class RtuFrame:
             label = "数量" if function in (15, 16) else "值"
             return f"地址 {start} · {label} {value}"
         return f"{len(payload)} 字节负载"
+
+    def localized_summary(self, english: bool = False) -> str:
+        if not english:
+            return self.summary
+        if len(self.raw) < 2:
+            return "Incomplete frame"
+        function = self.function or 0
+        payload = self.raw[2:-2] if len(self.raw) >= 4 else self.raw[2:]
+        if function & 0x80 and payload:
+            return f"Exception code 0x{payload[0]:02X}"
+        if function in (1, 2, 3, 4) and payload:
+            byte_count = payload[0]
+            if function in (3, 4) and byte_count % 2 == 0:
+                registers = [
+                    int.from_bytes(payload[i : i + 2], "big")
+                    for i in range(1, min(1 + byte_count, len(payload)), 2)
+                    if len(payload[i : i + 2]) == 2
+                ]
+                return f"{len(registers)} registers · " + ", ".join(map(str, registers[:6]))
+            return f"{byte_count} data bytes"
+        if function in (5, 6, 15, 16) and len(payload) >= 4:
+            start = int.from_bytes(payload[:2], "big")
+            value = int.from_bytes(payload[2:4], "big")
+            label = "count" if function in (15, 16) else "value"
+            return f"address {start} · {label} {value}"
+        return f"{len(payload)} payload bytes"
 
 
 def build_request(

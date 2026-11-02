@@ -21,7 +21,9 @@ def test_serial_worker_queue_loopback_and_clean_stop():
     worker.status_changed.connect(
         lambda connected, _detail: worker.send(b"\x01\x03\x00\x00") if connected else None
     )
-    QTimer.singleShot(300, app.quit)
+    # Full UI test runs can leave the Windows event loop briefly busy; allow
+    # enough time for the worker thread to open loop:// and emit the frame.
+    QTimer.singleShot(1000, app.quit)
     worker.start()
     app.exec()
     worker.stop()
