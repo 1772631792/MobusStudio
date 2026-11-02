@@ -7,8 +7,146 @@ from itertools import islice
 import math
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QRegion, QWheelEvent
-from PySide6.QtWidgets import QMenu, QStyle, QStyleOptionTab, QStylePainter, QTabBar, QWidget
+from PySide6.QtGui import (
+    QColor, QDoubleValidator, QFont, QIntValidator, QMouseEvent, QPainter,
+    QPainterPath, QPen, QRegion, QWheelEvent,
+)
+from PySide6.QtWidgets import QLineEdit, QMenu, QStyle, QStyleOptionTab, QStylePainter, QTabBar, QWidget
+
+
+class IntegerEdit(QLineEdit):
+    """Plain integer field with spin-box-compatible value/range methods."""
+
+    valueChanged = Signal(int)
+
+    def __init__(self, value: int = 0, parent=None) -> None:
+        super().__init__(parent)
+        self._minimum = -2_147_483_648
+        self._maximum = 2_147_483_647
+        self._special_text = ""
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.textEdited.connect(self._text_edited)
+        self.editingFinished.connect(self._normalize)
+        self.setValue(value)
+
+    def _update_validator(self) -> None:
+        self.setValidator(QIntValidator(self._minimum, self._maximum, self))
+
+    def setRange(self, minimum: int, maximum: int) -> None:  # noqa: N802
+        self._minimum, self._maximum = int(minimum), int(maximum)
+        self._update_validator()
+        self.setValue(min(max(self.value(), self._minimum), self._maximum))
+
+    def setMinimum(self, minimum: int) -> None:  # noqa: N802
+        self.setRange(minimum, self._maximum)
+
+    def setMaximum(self, maximum: int) -> None:  # noqa: N802
+        self.setRange(self._minimum, maximum)
+
+    def value(self) -> int:
+        try:
+            return int(self.text().strip())
+        except ValueError:
+            return self._minimum if self._minimum > 0 else 0
+
+    def setValue(self, value: int) -> None:  # noqa: N802
+        value = min(max(int(value), self._minimum), self._maximum)
+        previous = self.value()
+        text = str(value)
+        if self.text() != text:
+            self.setText(text)
+        if value != previous:
+            self.valueChanged.emit(value)
+
+    def setSpecialValueText(self, text: str) -> None:  # noqa: N802
+        self._special_text = text
+        if text:
+            self.setToolTip(f"{self._minimum} 表示{text}")
+
+    def setSingleStep(self, _step: int) -> None:  # noqa: N802
+        pass
+
+    def setButtonSymbols(self, _symbols) -> None:  # noqa: N802
+        pass
+
+    def setDisplayIntegerBase(self, _base: int) -> None:  # noqa: N802
+        pass
+
+    def _text_edited(self, text: str) -> None:
+        try:
+            value = int(text)
+        except ValueError:
+            return
+        if self._minimum <= value <= self._maximum:
+            self.valueChanged.emit(value)
+
+    def _normalize(self) -> None:
+        self.setValue(self.value())
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        event.ignore()
+
+
+class FloatEdit(QLineEdit):
+    """Plain floating-point field with spin-box-compatible value methods."""
+
+    valueChanged = Signal(float)
+
+    def __init__(self, value: float = 0.0, parent=None) -> None:
+        super().__init__(parent)
+        self._minimum = -1e100
+        self._maximum = 1e100
+        self._decimals = 8
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.textEdited.connect(self._text_edited)
+        self.editingFinished.connect(self._normalize)
+        self.setValue(value)
+
+    def _update_validator(self) -> None:
+        validator = QDoubleValidator(self._minimum, self._maximum, self._decimals, self)
+        validator.setNotation(QDoubleValidator.Notation.ScientificNotation)
+        self.setValidator(validator)
+
+    def setRange(self, minimum: float, maximum: float) -> None:  # noqa: N802
+        self._minimum, self._maximum = float(minimum), float(maximum)
+        self._update_validator()
+        self.setValue(min(max(self.value(), self._minimum), self._maximum))
+
+    def setDecimals(self, decimals: int) -> None:  # noqa: N802
+        self._decimals = int(decimals)
+        self._update_validator()
+
+    def setSingleStep(self, _step: float) -> None:  # noqa: N802
+        pass
+
+    def value(self) -> float:
+        try:
+            return float(self.text().strip())
+        except ValueError:
+            return 0.0
+
+    def setValue(self, value: float) -> None:  # noqa: N802
+        value = min(max(float(value), self._minimum), self._maximum)
+        previous = self.value()
+        text = f"{value:.{self._decimals}g}"
+        if self.text() != text:
+            self.setText(text)
+        if value != previous:
+            self.valueChanged.emit(value)
+
+    def _text_edited(self, text: str) -> None:
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        if self._minimum <= value <= self._maximum:
+            self.valueChanged.emit(value)
+
+    def _normalize(self) -> None:
+        self.setValue(self.value())
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        event.ignore()
 
 
 class HorizontalTextSideTabBar(QTabBar):

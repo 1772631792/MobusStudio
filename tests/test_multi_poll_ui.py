@@ -136,3 +136,20 @@ def test_parser_is_bound_to_selected_poll_block() -> None:
     window._parse_frame_channels(RtuFrame(p2_frame, datetime.now(), "RX"), poll_id="P2")
     assert config["item"].text(2) == "34"
     window.close()
+
+
+def test_multi_value_parser_keeps_parent_compact_and_values_on_children() -> None:
+    _app()
+    window = MainWindow()
+    window.parser_name.setText("三相电压")
+    window.parser_type.setCurrentText("uint16")
+    window.parser_count.setValue(3)
+    window._add_parser()
+    config = window.parsers[-1]
+    frame = append_crc(bytes.fromhex("01 03 06 00 01 00 02 00 03"))
+    window._parse_frame_channels(RtuFrame(frame, datetime.now(), "RX"), poll_id="P1")
+
+    assert config["item"].text(2) == "已更新"
+    assert [config["member_items"][index].text(2) for index in range(3)] == ["1", "2", "3"]
+    assert window.parser_tree.header().sectionSize(1) >= 160
+    window.close()

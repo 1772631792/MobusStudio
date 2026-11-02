@@ -21,8 +21,8 @@ QPushButton#primary { background: #0879be; border-color: #0879be; color: #ffffff
 QPushButton#primary:hover { background: #1593d5; }
 QPushButton#danger { color: #e35a68; }
 QPushButton:disabled { color: #a6aeb9; background: #f1f3f6; border-color: #dfe4e9; }
-QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background: rgba(255, 255, 255, 230); border: 1px solid #cbd4de; border-radius: 9px; padding: 7px 10px; min-height: 22px; selection-background-color: #1687c7; }
-QComboBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #6faad0; }
+QComboBox, QLineEdit { background: rgba(255, 255, 255, 230); border: 1px solid #cbd4de; border-radius: 9px; padding: 7px 10px; min-height: 22px; selection-background-color: #1687c7; }
+QComboBox:hover, QLineEdit:hover { border-color: #6faad0; }
 QComboBox::drop-down { border: none; width: 22px; }
 QCheckBox { spacing: 8px; color: #526174; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #9aa9ba; border-radius: 4px; background: #ffffff; }
@@ -72,8 +72,8 @@ QPushButton#primary { background: #00bfa5; border-color: #00bfa5; color: #061b18
 QPushButton#primary:hover { background: #1bd7bc; }
 QPushButton#danger { color: #ff7e8d; }
 QPushButton:disabled { color: #566277; background: #141b27; border-color: #202a39; }
-QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background: rgba(13, 20, 32, 230); border: 1px solid #29374b; border-radius: 9px; padding: 7px 10px; min-height: 22px; selection-background-color: #00a58f; }
-QComboBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #3c506b; }
+QComboBox, QLineEdit { background: rgba(13, 20, 32, 230); border: 1px solid #29374b; border-radius: 9px; padding: 7px 10px; min-height: 22px; selection-background-color: #00a58f; }
+QComboBox:hover, QLineEdit:hover { border-color: #3c506b; }
 QComboBox::drop-down { border: none; width: 22px; }
 QCheckBox { spacing: 8px; color: #adbacb; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #40516a; border-radius: 4px; background: #0d1420; }

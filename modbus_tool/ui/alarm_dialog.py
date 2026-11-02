@@ -7,7 +7,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QLabel,
     QMessageBox,
@@ -15,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from modbus_tool.core.alarm import AlarmRule
+from modbus_tool.ui.widgets import FloatEdit
 
 
 class AlarmRuleDialog(QDialog):
@@ -75,8 +75,8 @@ class AlarmRuleDialog(QDialog):
             self._mode_changed()
 
     @staticmethod
-    def _number_box() -> QDoubleSpinBox:
-        box = QDoubleSpinBox()
+    def _number_box() -> FloatEdit:
+        box = FloatEdit()
         box.setRange(-1e100, 1e100)
         box.setDecimals(8)
         box.setSingleStep(1.0)

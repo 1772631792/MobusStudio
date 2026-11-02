@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -67,7 +66,7 @@ from modbus_tool.core.settings import Settings
 from modbus_tool.core.wave_recorder import CsvExportWorker, WaveRecorder
 from modbus_tool.ui.styles import DARK_STYLE, LIGHT_STYLE
 from modbus_tool.ui.alarm_dialog import AlarmRuleDialog
-from modbus_tool.ui.widgets import GlassMenu, HorizontalTextSideTabBar, LivePlotWidget
+from modbus_tool.ui.widgets import GlassMenu, HorizontalTextSideTabBar, IntegerEdit, LivePlotWidget
 
 
 FUNCTION_OPTIONS = [
@@ -851,6 +850,18 @@ class MainWindow(QMainWindow):
         scroll.setWidget(page)
         return scroll, layout
 
+    @staticmethod
+    def _field_with_unit(field: QWidget, unit: str) -> QWidget:
+        wrapper = QWidget()
+        row = QHBoxLayout(wrapper)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(field, 1)
+        unit_label = QLabel(unit, objectName="muted")
+        unit_label.setMinimumWidth(26)
+        row.addWidget(unit_label)
+        return wrapper
+
     def _build_poll_tab(self) -> QWidget:
         page, layout = self._tab_page()
         layout.addWidget(QLabel("连续读取轮询", objectName="sectionTitle"))
@@ -885,7 +896,7 @@ class MainWindow(QMainWindow):
         self.poll_name.setPlaceholderText("例如：温度区")
         self.poll_enabled = QCheckBox("启用此轮询项")
         self.poll_enabled.setChecked(True)
-        self.poll_address = QSpinBox()
+        self.poll_address = IntegerEdit()
         self.poll_address.setRange(1, 247)
         self.poll_address.setValue(1)
         self.poll_function = QComboBox()
@@ -893,21 +904,19 @@ class MainWindow(QMainWindow):
             self.poll_function.addItem(text, code)
         self.poll_function.setCurrentIndex(2)
         self.poll_function.currentIndexChanged.connect(self._poll_function_changed)
-        self.poll_start = QSpinBox()
+        self.poll_start = IntegerEdit()
         self.poll_start.setRange(0, 65535)
         self.poll_start.setValue(0)
-        self.poll_quantity = QSpinBox()
+        self.poll_quantity = IntegerEdit()
         self.poll_quantity.setRange(1, 125)
         self.poll_quantity.setValue(10)
-        self.poll_interval = QSpinBox()
+        self.poll_interval = IntegerEdit()
         self.poll_interval.setRange(0, 60000)
         self.poll_interval.setValue(50)
-        self.poll_interval.setSuffix(" ms")
         self.poll_interval.setToolTip("收到完整响应后，等待此时间再发送下一请求")
-        self.poll_timeout = QSpinBox()
+        self.poll_timeout = IntegerEdit()
         self.poll_timeout.setRange(50, 10000)
         self.poll_timeout.setValue(500)
-        self.poll_timeout.setSuffix(" ms")
         self.poll_range_mode = QComboBox()
         self.poll_range_mode.addItem("自动扩展", "auto")
         self.poll_range_mode.addItem("手动固定", "manual")
@@ -918,8 +927,8 @@ class MainWindow(QMainWindow):
         form.addRow("范围模式", self.poll_range_mode)
         form.addRow("起始寄存器", self.poll_start)
         form.addRow("寄存器数量", self.poll_quantity)
-        form.addRow("响应后间隔", self.poll_interval)
-        form.addRow("响应超时", self.poll_timeout)
+        form.addRow("响应后间隔", self._field_with_unit(self.poll_interval, "ms"))
+        form.addRow("响应超时", self._field_with_unit(self.poll_timeout, "ms"))
         layout.addLayout(form)
 
         self.poll_button = QPushButton("开始安全轮询", objectName="primary")
@@ -1009,14 +1018,14 @@ class MainWindow(QMainWindow):
         self.parser_source = QComboBox()
         self.parser_source.addItem("Modbus 数据区", "data")
         self.parser_source.addItem("完整 RTU 帧", "frame")
-        self.parser_address = QSpinBox()
+        self.parser_address = IntegerEdit()
         self.parser_address.setRange(0, 247)
         self.parser_address.setSpecialValueText("全部")
         self.parser_function = QComboBox()
         self.parser_function.addItem("全部功能码", -1)
         for text, code in FUNCTION_OPTIONS:
             self.parser_function.addItem(text, code)
-        self.parser_offset = QSpinBox()
+        self.parser_offset = IntegerEdit()
         self.parser_offset.setRange(0, 65535)
         self.parser_offset.setValue(self.poll_start.value())
         self.parser_offset.setToolTip("填写设备手册中的绝对寄存器地址，例如1103；float32下一项通常为1105")
@@ -1025,7 +1034,7 @@ class MainWindow(QMainWindow):
         self.parser_byte_lane.addItem("高字节", 0)
         self.parser_byte_lane.addItem("低字节", 1)
         self.parser_byte_lane.setEnabled(False)
-        self.parser_count = QSpinBox()
+        self.parser_count = IntegerEdit()
         self.parser_count.setRange(1, 128)
         self.parser_scale = QLineEdit("1.0")
         self.parser_scale.setPlaceholderText("倍率，例如 0.1")
@@ -1068,8 +1077,8 @@ class MainWindow(QMainWindow):
         self.parser_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.parser_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.parser_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.parser_tree.header().resizeSection(0, 125)
-        self.parser_tree.header().resizeSection(1, 105)
+        self.parser_tree.header().resizeSection(0, 108)
+        self.parser_tree.header().resizeSection(1, 165)
         self.parser_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.parser_tree.setMinimumHeight(220)
         self.parser_tree.setAlternatingRowColors(True)
@@ -1096,13 +1105,13 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         self.write_form = form
-        self.write_address = QSpinBox()
+        self.write_address = IntegerEdit()
         self.write_address.setRange(1, 247)
         self.write_address.setValue(1)
         self.write_target = QComboBox()
         self.write_target.addItem("保持寄存器", "register")
         self.write_target.addItem("线圈", "coil")
-        self.write_start = QSpinBox()
+        self.write_start = IntegerEdit()
         self.write_start.setRange(0, 65535)
         self.write_start_label = QLabel("起始寄存器")
         self.write_type = QComboBox()
@@ -1363,16 +1372,16 @@ class MainWindow(QMainWindow):
             layout.addWidget(check)
 
         form = QFormLayout()
-        self.builder_address = QSpinBox()
+        self.builder_address = IntegerEdit()
         self.builder_address.setRange(1, 247)
         self.builder_address.setValue(1)
         self.builder_function = QComboBox()
         for text, code in FUNCTION_OPTIONS:
             self.builder_function.addItem(text, code)
-        self.builder_start = QSpinBox()
+        self.builder_start = IntegerEdit()
         self.builder_start.setRange(0, 65535)
         self.builder_start.setDisplayIntegerBase(10)
-        self.builder_quantity = QSpinBox()
+        self.builder_quantity = IntegerEdit()
         self.builder_quantity.setRange(1, 2000)
         self.builder_quantity.setValue(1)
         self.builder_values = QLineEdit()
@@ -1416,12 +1425,12 @@ class MainWindow(QMainWindow):
 
         repeat_row = QHBoxLayout()
         self.repeat_send = QCheckBox("循环发送")
-        self.repeat_interval = QSpinBox()
+        self.repeat_interval = IntegerEdit()
         self.repeat_interval.setRange(20, 600000)
         self.repeat_interval.setValue(1000)
-        self.repeat_interval.setSuffix(" ms")
         repeat_row.addWidget(self.repeat_send)
-        repeat_row.addWidget(self.repeat_interval)
+        repeat_row.addWidget(self.repeat_interval, 1)
+        repeat_row.addWidget(QLabel("ms", objectName="muted"))
         layout.addLayout(repeat_row)
         layout.addStretch()
         self.send_button = QPushButton("发送帧", objectName="primary")
@@ -1519,11 +1528,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.uppercase_hex)
         limit_row = QHBoxLayout()
         limit_row.addWidget(QLabel("帧缓存上限"))
-        self.keep_limit = QSpinBox()
+        self.keep_limit = IntegerEdit()
         self.keep_limit.setRange(100, 100000)
         self.keep_limit.setValue(5000)
-        self.keep_limit.setSuffix(" 帧")
         limit_row.addWidget(self.keep_limit, 1)
+        limit_row.addWidget(QLabel("帧", objectName="muted"))
         layout.addLayout(limit_row)
         layout.addSpacing(18)
         layout.addWidget(QLabel("工程 JSON", objectName="sectionTitle"))
@@ -2986,7 +2995,8 @@ class MainWindow(QMainWindow):
                 continue
             if update_display:
                 display = ", ".join(f"{value:.6g}" if isinstance(value, float) else str(value) for value in values)
-                self._set_tree_text(config["item"], 2, display if len(display) < 48 else display[:47] + "…")
+                parent_display = display if config["count"] == 1 else "已更新"
+                self._set_tree_text(config["item"], 2, parent_display)
                 if config["item"].toolTip(2) != display:
                     config["item"].setToolTip(2, display)
             for index, value in enumerate(values):

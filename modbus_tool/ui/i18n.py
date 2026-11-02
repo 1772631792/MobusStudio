@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
     QLabel,
-    QSpinBox,
-    QDoubleSpinBox,
     QTabBar,
     QTableView,
     QTreeWidget,
@@ -67,7 +65,7 @@ ENGLISH = {
     "帧列表显示毫秒时间戳": "Show milliseconds", "HEX 使用大写字母": "Use uppercase HEX", "帧缓存上限": "Frame Cache Limit",
     "工程 JSON": "Project JSON", "导出配置 JSON": "Export Project JSON",
     "绑定解析成员": "Bind Parsed Value", "暂无可绑定成员": "No values available", "自动适应 / 复位视图": "Auto-fit / Reset View",
-    "回到最新数据": "Return to Latest", "显示全部通道": "Show All Channels", "添加检测通道": "Add Channel",
+    "回到最新数据": "Return to Latest", "显示全部通道": "Show All Channels", "添加检测通道": "Add Channel", "已更新": "Updated",
     "参数报警规则": "Alarm Rule", "单阈值": "Single Threshold", "双阈值区间": "Range Threshold", "启用此规则": "Enable this rule",
     "阈值模式": "Threshold Mode", "阈值": "Threshold", "上限": "Upper Limit", "下限": "Lower Limit",
     "区间外报警": "Alarm Outside Range", "区间内报警": "Alarm Inside Range", "确定": "OK", "取消": "Cancel",
@@ -112,8 +110,6 @@ def translate_ui(root: QObject) -> None:
         if isinstance(obj, QTabBar):
             for index in range(obj.count()):
                 obj.setTabText(index, translate_text(obj.tabText(index)))
-        if isinstance(obj, (QSpinBox, QDoubleSpinBox)):
-            obj.setSuffix(translate_text(obj.suffix()))
         if isinstance(obj, QTableView) and obj.model() is not None:
             model = obj.model()
             for column in range(model.columnCount()):
